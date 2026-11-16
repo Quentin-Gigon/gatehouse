@@ -92,5 +92,5 @@ cat <<EOF
 Agent '$NAME' ($AGENT_ID) is connected. It can sign in to nothing yet. Grant it an account:
   gatehouse-admin account list
   gatehouse-admin grant add --agent $NAME --account "<account name>" --for forever
-[[ "$HARNESS" == none ]] || echo "Restart open $HARNESS sessions so they pick up the new tools."
 EOF
+[[ "$HARNESS" == none ]] || echo "Restart open $HARNESS sessions so they pick up the new tools."
