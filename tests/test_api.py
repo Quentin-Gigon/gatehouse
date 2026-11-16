@@ -58,9 +58,11 @@ async def test_unapproved_agent_and_unknown_account_look_the_same(env):
 
 async def test_expired_once_and_revoked_grants(env):
     cid = env.add_account()
-    g = env.grant(cid, kind="until", expires_at=time.time() + 1.5)
+    await env.session_id()                                  # start the browser before the grant's clock runs
+    expires = time.time() + 8
+    g = env.grant(cid, kind="until", expires_at=expires)
     assert (await env.login(cid))["status"] == L.SIGNED_IN
-    await asyncio.sleep(1.6)
+    await asyncio.sleep(max(0.0, expires - time.time()) + 0.2)
     r = await env.login(cid)
     assert r["status"] == L.PERMISSION_REQUIRED                                  # expired: user is asked, nothing is typed
     assert len(env.store.approvals()) == 1
