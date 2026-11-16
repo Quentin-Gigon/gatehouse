@@ -1,0 +1,302 @@
+"""The broker daemon: authenticated agent API plus the gated DevTools relay."""
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import hmac
+import json
+import secrets
+import time
+import uuid
+from dataclasses import dataclass, field
+
+from aiohttp import web
+
+from . import login as L
+from .cdp import Browser, CDPError
+from .config import Paths
+from .origins import origin_of
+from .policy import authorize, visible_accounts
+from .store import Store
+from .vault import Vault
+
+CLOCK_SKEW = 60.0
+MAX_BODY = 64 * 1024
+MAX_FAILURES = 2
+REQUEST_TTL = 3600.0
+
+
+def sign(sign_key: str, method: str, path: str, ts: str, nonce: str, body: bytes) -> str:
+    msg = "\n".join([method.upper(), path, ts, nonce, hashlib.sha256(body).hexdigest()]).encode()
+    return hmac.new(sign_key.encode(), msg, hashlib.sha256).hexdigest()
+
+
+@dataclass
+class LoginRequest:
+    id: str
+    agent_id: str
+    credential_id: str
+    origin: str
+    status: str = L.PENDING
+    detail: str = "queued"
+    created_at: float = field(default_factory=time.time)
+    task: asyncio.Task | None = None
+
+    def public(self) -> dict:
+        return {"request_id": self.id, "account_id": self.credential_id, "status": self.status, "detail": self.detail}
+
+
+class Broker:
+    def __init__(self, paths: Paths, key: bytes | None, port: int, headless: bool = False,
+                 chrome: str | None = None, chrome_args: tuple[str, ...] = (), timeouts: L.Timeouts | None = None):
+        self.paths, self.key, self.port = paths, key, port
+        self.store = Store(paths.db)
+        self.vault = Vault(paths.vault)
+        self.boot_id = secrets.token_hex(8)
+        self.headless, self.chrome, self.chrome_args = headless, chrome, chrome_args
+        self.timeouts = timeouts or L.Timeouts()
+        self.browsers: dict[str, Browser] = {}
+        self.session_ids: dict[str, str] = {}
+        self.requests: dict[str, LoginRequest] = {}
+        self._browser_locks: dict[str, asyncio.Lock] = {}
+
+    # --- app -----------------------------------------------------------------
+    def app(self) -> web.Application:
+        app = web.Application(client_max_size=MAX_BODY, middlewares=[self._local_only])
+        r = app.router
+        r.add_post("/v1/accounts", self._api(self.h_accounts))
+        r.add_post("/v1/browser", self._api(self.h_browser))
+        r.add_post("/v1/login", self._api(self.h_login))
+        r.add_post("/v1/login/status", self._api(self.h_status))
+        r.add_post("/v1/login/cancel", self._api(self.h_cancel))
+        r.add_post("/v1/logout", self._api(self.h_logout))
+        r.add_get("/cdp/{token}/json/version", self.h_cdp_version)
+        r.add_get("/cdp/{token}/json/version/", self.h_cdp_version)
+        r.add_get("/cdp/{token}/devtools/browser", self.h_cdp_ws)
+        app.on_startup.append(self._on_start)
+        app.on_cleanup.append(self._on_stop)
+        return app
+
+    async def _on_start(self, app) -> None:
+        self.store.set_setting("boot_id", self.boot_id)
+        self.store.set_setting("port", str(self.port))
+        self.store.prune_audit()
+        self.store.audit("broker_started", result="unlocked" if self.key else "locked")
+
+    async def _on_stop(self, app) -> None:
+        self.store.set_setting("boot_id", "")
+        for req in self.requests.values():
+            if req.task and not req.task.done():
+                req.task.cancel()
+        for b in self.browsers.values():
+            await b.stop()
+
+    @web.middleware
+    async def _local_only(self, request: web.Request, handler):
+        """Refuse anything that looks like it came from a web page (DNS rebinding, cross-site requests)."""
+        host = request.headers.get("Host", "")
+        if host not in (f"127.0.0.1:{self.port}", f"localhost:{self.port}") or "Origin" in request.headers:
+            return web.json_response({"error": "forbidden"}, status=403)
+        return await handler(request)
+
+    def _api(self, fn):
+        async def handler(request: web.Request):
+            body = await request.read()
+            h = request.headers
+            agent_id, ts, nonce, sig = (h.get("X-GH-Agent", ""), h.get("X-GH-Timestamp", ""),
+                                        h.get("X-GH-Nonce", ""), h.get("X-GH-Signature", ""))
+            agent = self.store.agent(agent_id) if agent_id else None
+            # Compute a signature even for unknown agents so both paths cost the same.
+            expected = sign(agent["sign_key"] if agent else "x" * 43, request.method, request.path, ts, nonce, body)
+            ok = agent is not None and agent["revoked_at"] is None and hmac.compare_digest(expected, sig)
+            try:
+                fresh = abs(time.time() - float(ts)) <= CLOCK_SKEW
+            except ValueError:
+                fresh = False
+            if not ok or not fresh or not 16 <= len(nonce) <= 128:
+                self.store.audit("api_rejected", agent_id=agent_id[:32] if agent else None, decision="denied",
+                                 result="bad_signature" if not ok else "stale_or_malformed")
+                return web.json_response({"error": "unauthenticated"}, status=401)
+            if not self.store.use_nonce(agent_id, nonce, float(ts), CLOCK_SKEW):
+                self.store.audit("api_rejected", agent_id=agent_id, decision="denied", result="replay")
+                return web.json_response({"error": "replayed request"}, status=401)
+            try:
+                payload = json.loads(body or b"{}")
+                if not isinstance(payload, dict):
+                    raise ValueError
+            except ValueError:
+                return web.json_response({"error": "invalid JSON body"}, status=400)
+            return web.json_response(await fn(agent_id, payload))
+        return handler
+
+    # --- browser sessions ------------------------------------------------------
+    async def browser_for(self, agent_id: str) -> Browser:
+        lock = self._browser_locks.setdefault(agent_id, asyncio.Lock())
+        async with lock:
+            b = self.browsers.get(agent_id)
+            if b is None or not b.alive:
+                b = Browser(self.paths.profiles / agent_id, chrome=self.chrome, headless=self.headless,
+                            extra_args=self.chrome_args)
+                await b.start()
+                self.browsers[agent_id] = b
+                self.session_ids[agent_id] = "bs_" + secrets.token_hex(8)
+                self.store.audit("browser_started", agent_id=agent_id)
+            return b
+
+    # --- API handlers ------------------------------------------------------------
+    async def h_accounts(self, agent_id: str, p: dict) -> dict:
+        if self.key is None:
+            return {"status": L.VAULT_LOCKED, "accounts": []}
+        return {"status": "ok", "accounts": visible_accounts(self.store, agent_id, self.vault.load(self.key), self.boot_id)}
+
+    async def h_browser(self, agent_id: str, p: dict) -> dict:
+        try:
+            b = await self.browser_for(agent_id)
+        except CDPError:
+            return {"status": "browser_unavailable"}
+        return {"status": "ok", "browser_session_id": self.session_ids[agent_id], "gate_open": b.gate_open}
+
+    async def h_login(self, agent_id: str, p: dict) -> dict:
+        cid = str(p.get("account_id", ""))[:64]
+
+        def out(status: str, detail: str, origin: str | None = None, decision: str = "denied") -> dict:
+            self.store.audit("login_request", agent_id, cid or None, origin, decision, f"{status}:{detail}")
+            return {"request_id": None, "account_id": cid, "status": status, "detail": detail}
+
+        if self.key is None:
+            return out(L.VAULT_LOCKED, "unlock_the_vault")
+        cred = self.vault.get(self.key, cid) if cid else None
+        if cred is None:
+            return out(L.PERMISSION_DENIED, "not_authorized")
+        history = self.store.grants(agent_id=agent_id, credential_id=cid)
+        if not history:
+            return out(L.PERMISSION_DENIED, "not_authorized")  # indistinguishable from an unknown account
+        origin = origin_of(cred.login_url) if cred.login_url else None
+        if origin is None or origin not in cred.origins:
+            return out(L.PERMISSION_REQUIRED, "account_has_no_approved_login_address")
+        if self.session_ids.get(agent_id) is None or p.get("browser_session_id") != self.session_ids[agent_id]:
+            return out(L.PERMISSION_DENIED, "unknown_browser_session", origin)
+        d = authorize(self.store, agent_id, cred, origin, self.boot_id)
+        if not d.allowed:
+            if d.reason == "no_grant" and any(g["revoked_at"] is None for g in history):
+                self.store.request_approval(agent_id, cid, origin)
+                return out(L.PERMISSION_REQUIRED, "grant_expired_or_does_not_cover_this_address", origin)
+            return out(L.PERMISSION_DENIED, d.reason, origin)
+        if self.store.failures(cid) >= MAX_FAILURES:
+            return out(L.FAILED, "blocked_after_repeated_failures_user_must_reset", origin)
+        for req in self.requests.values():
+            if req.agent_id == agent_id and req.credential_id == cid and req.task and not req.task.done():
+                return req.public()
+        if d.kind == "once" and not self.store.consume_once(d.grant_id):
+            self.store.request_approval(agent_id, cid, origin)
+            return out(L.PERMISSION_REQUIRED, "single_use_grant_already_used", origin)
+        grant = next(g for g in history if g["id"] == d.grant_id)
+        allowed = [o for o in json.loads(grant["origins"]) if o in cred.origins]
+        req = LoginRequest("req_" + uuid.uuid4().hex[:16], agent_id, cid, origin)
+        self._prune_requests()
+        self.requests[req.id] = req
+        self.store.audit("login_request", agent_id, cid, origin, "allowed", "started")
+        req.task = asyncio.create_task(self._run_login(req, cred, allowed, d.grant_id))
+        return req.public()
+
+    async def _run_login(self, req: LoginRequest, cred, allowed: list[str], grant_id: str) -> None:
+        status, detail, run, browser = L.FAILED, "browser_error", None, None
+        try:
+            browser = await self.browser_for(req.agent_id)
+            async with browser.lock:
+                g = [x for x in self.store.grants(agent_id=req.agent_id, credential_id=cred.id) if x["id"] == grant_id]
+                agent = self.store.agent(req.agent_id)
+                if not g or g[0]["revoked_at"] is not None or agent["revoked_at"] is not None or self.store.logins_disabled():
+                    status, detail = L.PERMISSION_DENIED, "revoked_before_use"
+                    return
+                await browser.close_gate()
+                run = L.LoginRun(browser, cred, allowed, self.timeouts,
+                                 on_status=lambda s, d: (setattr(req, "status", s), setattr(req, "detail", d)))
+                req.detail = "signing_in"
+                try:
+                    await run.open_tab()
+                    status, detail = await run.run()
+                finally:
+                    await asyncio.shield(run.finish(keep_tab=status in (L.SIGNED_IN, L.ALREADY)))
+                    browser.open_gate()
+        except asyncio.CancelledError:
+            status, detail = L.CANCELLED, "cancelled_by_agent"
+        except CDPError:
+            status, detail = L.FAILED, "browser_error"
+        finally:
+            if browser is not None:
+                browser.open_gate()
+            if status == L.FAILED and detail in ("credentials_rejected", "code_rejected"):
+                self.store.record_failure(cred.id)
+            elif status in (L.SIGNED_IN, L.ALREADY):
+                self.store.clear_failures(cred.id)
+                self.store.count_use(grant_id)
+            if status == L.PERMISSION_REQUIRED and run is not None and run.unapproved_origin:
+                self.store.request_approval(req.agent_id, cred.id, run.unapproved_origin)
+            req.status, req.detail = status, detail
+            self.store.audit("login_result", req.agent_id, cred.id, req.origin, "allowed", f"{status}:{detail}")
+
+    def _prune_requests(self) -> None:
+        cutoff = time.time() - REQUEST_TTL
+        for rid in [r.id for r in self.requests.values() if r.created_at < cutoff and (not r.task or r.task.done())]:
+            del self.requests[rid]
+
+    def _own_request(self, agent_id: str, p: dict) -> LoginRequest | None:
+        req = self.requests.get(str(p.get("request_id", "")))
+        return req if req and req.agent_id == agent_id else None
+
+    async def h_status(self, agent_id: str, p: dict) -> dict:
+        req = self._own_request(agent_id, p)
+        return req.public() if req else {"request_id": p.get("request_id"), "status": "unknown_request", "detail": "expired_or_not_yours"}
+
+    async def h_cancel(self, agent_id: str, p: dict) -> dict:
+        req = self._own_request(agent_id, p)
+        if req is None:
+            return {"request_id": p.get("request_id"), "status": "unknown_request", "detail": "expired_or_not_yours"}
+        if req.task and not req.task.done():
+            req.task.cancel()
+            await asyncio.wait([req.task], timeout=15)
+        return req.public()
+
+    async def h_logout(self, agent_id: str, p: dict) -> dict:
+        cid = str(p.get("account_id", ""))[:64]
+        cred = self.vault.get(self.key, cid) if self.key and cid else None
+        if cred is None or not self.store.grants(agent_id=agent_id, credential_id=cid):
+            return {"account_id": cid, "status": L.PERMISSION_DENIED, "detail": "not_authorized"}
+        if p.get("browser_session_id") != self.session_ids.get(agent_id):
+            return {"account_id": cid, "status": L.PERMISSION_DENIED, "detail": "unknown_browser_session"}
+        b = await self.browser_for(agent_id)
+        async with b.lock:
+            await L.clear_site_session(b, cred.origins)
+        self.store.audit("logout", agent_id, cid, None, "allowed", "local_session_removed")
+        return {"account_id": cid, "status": "local_session_removed",
+                "detail": "cookies_and_storage_cleared_locally_website_session_may_still_be_valid"}
+
+    # --- DevTools relay ------------------------------------------------------------
+    async def h_cdp_version(self, request: web.Request):
+        agent = self.store.agent_by_cdp_token(request.match_info["token"])
+        if agent is None:
+            return web.json_response({"error": "forbidden"}, status=403)
+        b = await self.browser_for(agent["id"])
+        return web.json_response({
+            "Browser": b.version.get("product", "Chrome"), "Protocol-Version": b.version.get("protocolVersion", "1.3"),
+            "webSocketDebuggerUrl": f"ws://127.0.0.1:{self.port}/cdp/{request.match_info['token']}/devtools/browser"})
+
+    async def h_cdp_ws(self, request: web.Request):
+        agent = self.store.agent_by_cdp_token(request.match_info["token"])
+        if agent is None:
+            return web.json_response({"error": "forbidden"}, status=403)
+        b = await self.browser_for(agent["id"])
+        if not b.gate_open:
+            return web.json_response({"error": "protected login in progress; retry shortly"}, status=423)
+        ws = web.WebSocketResponse(max_msg_size=256 * 1024 * 1024)
+        await ws.prepare(request)
+        await b.serve_agent(ws)
+        return ws
+
+
+async def serve(broker: Broker) -> web.AppRunner:
+    runner = web.AppRunner(broker.app(), access_log=None)  # no access log: paths carry relay tokens
+    await runner.setup()
+    await web.TCPSite(runner, "127.0.0.1", broker.port).start()
+    return runner

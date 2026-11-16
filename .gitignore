@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+.venv/
+# runtime state must never be committed
+.gatehouse/
+*.db
+*.db-wal
+*.db-shm
+vault.json
+profiles/
+agent-*.json
+*.csv
+!examples/*.csv

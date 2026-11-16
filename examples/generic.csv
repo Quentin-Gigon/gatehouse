@@ -1,0 +1,3 @@
+name,url,username,password,totp,notes
+Synthetic Books,https://books.example.test/login,reader@example.test,synthetic-Passw0rd!-not-real,,example only
+Synthetic Mail,https://mail.example.test,reader@example.test,another-synthetic-secret,JBSWY3DPEHPK3PXP,
