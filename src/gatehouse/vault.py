@@ -50,6 +50,7 @@ class Credential:
     imported_url: str = ""                              # informational only
     pre_click: list[str] = field(default_factory=list)  # CSS selectors to click before looking for fields
     success_selector: str = ""                          # CSS selector that only exists when signed in
+    allow_safari: bool = False                          # may also be typed into the user's Safari by the app
     created_at: float = 0.0
     updated_at: float = 0.0
 

@@ -19,6 +19,7 @@ final class AppModel: ObservableObject {
     @Published var selection: SidebarItem? = .websites
 
     let api = BrokerAPI()
+    let filler = FillerClient()
     private var timer: Timer?
     private var notified = Set<String>()
 
@@ -29,6 +30,7 @@ final class AppModel: ObservableObject {
         }
         Task { await poll() }
         Task { await detectHarnesses() }
+        filler.start()
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
 
@@ -254,6 +256,26 @@ final class AppModel: ObservableObject {
         await perform(allowed ? "Allowing…" : "Removing access…") { [self] in
             try await api.send("access", ["agent_id": agent.id, "account_id": account.id,
                                           "allowed": allowed, "duration": duration.rawValue])
+        }
+    }
+
+    // MARK: Safari
+
+    var safariReady: Bool { SafariFiller.hasPermission && attention?.appConnected == true }
+
+    /// Let agents that control the screen sign in to this account in Safari, typed by this app.
+    func setSafari(_ account: Account, allowed: Bool) async {
+        let ok = await perform(allowed ? "Allowing in Safari…" : "Turning off Safari…") { [self] in
+            if allowed && (FillerKey.load() == nil || attention?.appConnected != true) {
+                struct Key: Decodable { var fillerKey: String }
+                FillerKey.save(try await api.call("filler/register", as: Key.self).fillerKey)
+                filler.restart()
+            }
+            try await api.send("account/edit", ["account_id": account.id, "allow_safari": allowed])
+        }
+        if ok && allowed {
+            if !SafariFiller.hasPermission { SafariFiller.askForPermission() }
+            if !launchAtLogin { launchAtLogin = true }   // Safari sign-ins need the app running
         }
     }
 

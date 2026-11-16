@@ -139,7 +139,7 @@ async def test_mcp_adapter_end_to_end(env):
 
     assert (await asyncio.to_thread(rpc, "initialize", {"protocolVersion": "2025-06-18"}))["result"]["serverInfo"]["name"] == "gatehouse"
     tools = (await asyncio.to_thread(rpc, "tools/list"))["result"]["tools"]
-    assert {t["name"] for t in tools} == {"list_authorized_accounts", "request_login", "get_login_status", "logout"}
+    assert {t["name"] for t in tools} == {"list_authorized_accounts", "request_login", "sign_in_in_safari", "get_login_status", "logout"}
     assert not any("password" in json.dumps(t["inputSchema"]) for t in tools)     # no way to ask for a secret
     listed = await asyncio.to_thread(rpc, "tools/call", {"name": "list_authorized_accounts", "arguments": {}})
     assert cid in listed["result"]["content"][0]["text"]

@@ -335,6 +335,20 @@ struct SettingsView: View {
                 Text("Pausing stops every agent from signing in anywhere until you switch it back. Use it if something looks wrong.")
                     .font(.caption).foregroundStyle(.secondary)
             }
+            Section {
+                LabeledContent("Accessibility permission") {
+                    if SafariFiller.hasPermission {
+                        Label("Granted", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+                    } else {
+                        Button("Grant…") { SafariFiller.askForPermission() }
+                    }
+                }
+                LabeledContent("Connected to the service", value: model.attention?.appConnected == true ? "Yes" : "No")
+            } header: {
+                Text("Safari sign-in")
+            } footer: {
+                Text("Used only for websites where you switched on \u{201C}Also allow in Safari\u{201D}. The app must be running, so it opens at login.")
+            }
             Section("Service") {
                 LabeledContent("Status", value: model.service == .running ? "Running" : "Not running")
                 LabeledContent("Installed version", value: Paths.installedVersionString ?? "–")

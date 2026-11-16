@@ -23,6 +23,8 @@ from gatehouse.vault import Vault, new_credential  # noqa: E402
 from fakesite import PASSWORD, USER, Site  # noqa: E402
 
 PASSPHRASE = "test passphrase only"
+# Root, and Linux CI runners (Ubuntu 24.04 blocks the user namespaces Chrome's sandbox needs).
+NO_SANDBOX = ("--no-sandbox",) if os.geteuid() == 0 or (sys.platform == "linux" and os.environ.get("CI")) else ()
 
 
 def free_port() -> int:
@@ -53,7 +55,7 @@ class Env:
             await runner.setup()
             await web.TCPSite(runner, "127.0.0.1", port).start()
             self.runners.append(runner)
-        self.broker = Broker(self.paths, self.key, self.port, headless=True, chrome_args=("--no-sandbox",) if os.geteuid() == 0 else (),
+        self.broker = Broker(self.paths, self.key, self.port, headless=True, chrome_args=NO_SANDBOX,
                              timeouts=L.Timeouts(navigation=15, step=6, human=6, settle=0.3))
         self.runners.append(await serve(self.broker))
         self.store = self.broker.store

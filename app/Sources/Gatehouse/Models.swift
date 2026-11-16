@@ -14,6 +14,7 @@ struct Account: Codable, Identifiable, Hashable {
     var preClick: [String]
     var successSelector: String
     var failures: Int
+    var allowSafari: Bool?
     var id: String { accountId }
 
     /// "goodreads.com" for "https://www.goodreads.com"
@@ -97,6 +98,7 @@ struct Attention: Codable, Equatable {
     var handoffs: [Waiting]
     var approvals: Int
     var loginsDisabled: Bool
+    var appConnected: Bool?
 
     var count: Int { handoffs.count + approvals }
 }

@@ -42,7 +42,7 @@ When a website shows a CAPTCHA, you get a notification. Click it, solve the chec
 - **Sites that expose their login to page scripts.** A few websites make part of the login readable to the page itself, and a misbehaving agent could copy it. If you suspect misuse: disconnect the agent, then use the website's own "sign out everywhere".
 - **Passkeys, "Sign in with Google/Apple", and codes sent by text or email.** Those need you. Codes from an authenticator app can be automated: add the setup key to the website in Gatehouse.
 
-**Why it can't use your Safari or Chrome:** agents sign in inside Gatehouse's browser, never yours. If Gatehouse typed into your own browser, the login would sit in your user account, where any agent could read it. So it doesn't matter which browser you use, and agents that control your screen also do the signed-in part in the Gatehouse browser.
+**Safari and computer use:** normally agents sign in inside Gatehouse's own hidden browser, which works whichever browser you use. For agents that control your screen in Safari, switch on **Also allow in Safari** for a website: the agent asks Gatehouse, and the Gatehouse app opens the sign-in page in Safari and types the login itself, so the agent still never sees the password. This needs the Accessibility permission (Gatehouse asks once) and the app running (it opens at login). It's weaker than the hidden browser, because the signed-in session then lives in your Safari, so it's off unless you turn it on per website.
 
 ## When a website doesn't sign in
 

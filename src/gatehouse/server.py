@@ -14,6 +14,7 @@ from aiohttp import web
 
 from . import admin as A
 from . import login as L
+from . import totp as totp_mod
 from .cdp import Browser, CDPError
 from .handoff import CODE_PAGE, GONE, PAGE, Handoff
 from .config import Paths
@@ -29,6 +30,8 @@ ADMIN_IDLE = 900.0                    # the app re-asks for your Mac password af
 MAX_FAILURES = 2
 REQUEST_TTL = 3600.0
 REVOKE_POLL = 2.0
+FILLER_TIMEOUT = 180.0                # a Safari sign-in, including a person solving a CAPTCHA on screen
+FILLER_STATUSES = {L.SIGNED_IN, L.ALREADY, L.FAILED, L.UNSUPPORTED, L.PERMISSION_REQUIRED, L.CANCELLED}
 
 
 def sign(sign_key: str, method: str, path: str, ts: str, nonce: str, body: bytes) -> str:
@@ -65,6 +68,8 @@ class Broker:
         self.requests: dict[str, LoginRequest] = {}
         self._browser_locks: dict[str, asyncio.Lock] = {}
         self.handoffs: dict[str, Handoff] = {}
+        self.filler: web.WebSocketResponse | None = None       # the Gatehouse app, for Safari sign-ins
+        self._filler_pending: dict[str, tuple] = {}            # request_id -> (filler ws, future)
 
     # --- app -----------------------------------------------------------------
     def app(self) -> web.Application:
@@ -75,6 +80,8 @@ class Broker:
         r.add_post("/v1/login", self._api(self.h_login))
         r.add_post("/v1/login/status", self._api(self.h_status))
         r.add_post("/v1/login/cancel", self._api(self.h_cancel))
+        r.add_post("/v1/safari/login", self._api(self.h_safari_login))
+        r.add_get("/filler/ws", self.h_filler_ws)
         r.add_post("/v1/logout", self._api(self.h_logout))
         r.add_get("/cdp/{token}/json/version", self.h_cdp_version)
         r.add_get("/cdp/{token}/json/version/", self.h_cdp_version)
@@ -91,7 +98,7 @@ class Broker:
             "import/preview": self.a_import_preview, "import/apply": self.a_import_apply,
             "agent/connect": self.a_agent_connect, "agent/revoke": self.a_agent_revoke,
             "access": self.a_access, "approval/approve": self.a_approve, "approval/deny": self.a_deny,
-            "logins": self.a_logins,
+            "logins": self.a_logins, "filler/register": self.a_filler_register,
         }.items():
             r.add_post(f"/admin/{path}", self._admin(fn))
         app.on_startup.append(self._on_start)
@@ -241,6 +248,13 @@ class Broker:
     def a_logins(self, p: dict, token: str) -> dict:
         return A.set_logins(self.store, p)
 
+    def a_filler_register(self, p: dict, token: str) -> dict:
+        """A new key for the app's Safari channel; any previous key stops working."""
+        key = secrets.token_urlsafe(32)
+        self.store.set_setting("filler_key_hash", hashlib.sha256(key.encode()).hexdigest())
+        self.store.audit("filler_registered")
+        return {"filler_key": key}
+
     async def h_attention(self, request: web.Request):
         """What the app's menu-bar icon shows without being unlocked: who is waiting for you, nothing more."""
         agents = {a["id"]: a["name"] for a in self.store.agents()}
@@ -251,6 +265,7 @@ class Broker:
                           "account": names.get(h.account_id, ""), "origin": h.origin} for h in self.handoffs.values()],
             "approvals": len(self.store.approvals()),
             "logins_disabled": self.store.logins_disabled(),
+            "app_connected": self.filler is not None and not self.filler.closed,
         })
 
     # --- browser sessions ------------------------------------------------------
@@ -281,6 +296,13 @@ class Broker:
         return {"status": "ok", "browser_session_id": self.session_ids[agent_id], "gate_open": b.gate_open}
 
     async def h_login(self, agent_id: str, p: dict) -> dict:
+        return self._start_login(agent_id, p, safari=False)
+
+    async def h_safari_login(self, agent_id: str, p: dict) -> dict:
+        """Sign in in the user's own Safari, typed by the Gatehouse app (for computer-use agents)."""
+        return self._start_login(agent_id, p, safari=True)
+
+    def _start_login(self, agent_id: str, p: dict, safari: bool) -> dict:
         cid = str(p.get("account_id", ""))[:64]
 
         def out(status: str, detail: str, origin: str | None = None, decision: str = "denied") -> dict:
@@ -298,7 +320,12 @@ class Broker:
         origin = origin_of(cred.login_url) if cred.login_url else None
         if origin is None or origin not in cred.origins:
             return out(L.PERMISSION_REQUIRED, "account_has_no_approved_login_address")
-        if self.session_ids.get(agent_id) is None or p.get("browser_session_id") != self.session_ids[agent_id]:
+        if safari:
+            if not cred.allow_safari:
+                return out(L.PERMISSION_DENIED, "safari_sign_in_not_allowed_for_this_account_ask_the_user", origin)
+            if self.filler is None or self.filler.closed:
+                return out(L.FAILED, "gatehouse_app_not_running_ask_the_user_to_open_it", origin)
+        elif self.session_ids.get(agent_id) is None or p.get("browser_session_id") != self.session_ids[agent_id]:
             return out(L.PERMISSION_DENIED, "unknown_browser_session", origin)
         d = authorize(self.store, agent_id, cred, origin, self.boot_id)
         if not d.allowed:
@@ -319,9 +346,85 @@ class Broker:
         req = LoginRequest("req_" + uuid.uuid4().hex[:16], agent_id, cid, origin)
         self._prune_requests()
         self.requests[req.id] = req
-        self.store.audit("login_request", agent_id, cid, origin, "allowed", "started")
-        req.task = asyncio.create_task(self._run_login(req, cred, allowed, d.grant_id))
+        self.store.audit("login_request", agent_id, cid, origin, "allowed", "started_in_safari" if safari else "started")
+        run = self._run_safari(req, cred, allowed, d.grant_id) if safari else self._run_login(req, cred, allowed, d.grant_id)
+        req.task = asyncio.create_task(run)
         return req.public()
+
+    # --- Safari sign-in through the app ---------------------------------------------------
+    async def _run_safari(self, req: LoginRequest, cred, allowed: list[str], grant_id: str) -> None:
+        status, detail = L.FAILED, "safari_error"
+        filler = self.filler
+        fut = asyncio.get_running_loop().create_future()
+        try:
+            if filler is None or filler.closed:
+                status, detail = L.FAILED, "gatehouse_app_not_running_ask_the_user_to_open_it"
+                return
+            self._filler_pending[req.id] = (filler, fut)
+            req.detail = "typing_in_safari"
+            await filler.send_json({
+                "type": "fill", "request_id": req.id, "account": cred.name, "login_url": cred.login_url,
+                "origins": allowed, "username": cred.username, "password": cred.password,
+                "totp": totp_mod.code(cred.totp) if cred.totp else None})
+            try:
+                res = await asyncio.wait_for(fut, FILLER_TIMEOUT)
+            except asyncio.TimeoutError:
+                status, detail = L.FAILED, "safari_sign_in_timed_out"
+                return
+            status = res.get("status") if res.get("status") in FILLER_STATUSES else L.FAILED
+            detail = str(res.get("detail") or "")[:80] or "safari"
+        except asyncio.CancelledError:
+            status, detail = L.CANCELLED, "cancelled_by_agent"
+            if filler is not None and not filler.closed:
+                await filler.send_json({"type": "cancel", "request_id": req.id})
+        except (ConnectionError, RuntimeError):
+            status, detail = L.FAILED, "gatehouse_app_disconnected"
+        finally:
+            self._filler_pending.pop(req.id, None)
+            if status == L.FAILED and detail == "credentials_rejected":
+                self.store.record_failure(req.credential_id)
+            elif status in (L.SIGNED_IN, L.ALREADY):
+                self.store.clear_failures(req.credential_id)
+                self.store.count_use(grant_id)
+            req.status, req.detail = status, detail
+            self.store.audit("login_result", req.agent_id, req.credential_id, req.origin, "allowed", f"{status}:{detail}")
+
+    async def h_filler_ws(self, request: web.Request):
+        """The Gatehouse app's channel: it receives Safari sign-ins to type. Its key is issued only to
+        an unlocked app (admin token) and kept in your login keychain; agents never get it."""
+        auth = request.headers.get("Authorization", "")
+        token = auth[7:] if auth.startswith("Bearer ") else ""
+        stored = self.store.get_setting("filler_key_hash") or ""
+        if not token or not stored or not hmac.compare_digest(hashlib.sha256(token.encode()).hexdigest(), stored):
+            self.store.audit("filler_rejected", decision="denied")
+            return web.json_response({"error": "forbidden"}, status=403)
+        ws = web.WebSocketResponse(heartbeat=20, max_msg_size=64 * 1024)
+        await ws.prepare(request)
+        old, self.filler = self.filler, ws
+        if old is not None and not old.closed:
+            await old.close(code=1000, message=b"replaced")
+        try:
+            async for msg in ws:
+                if msg.type != web.WSMsgType.TEXT:
+                    continue
+                try:
+                    data = json.loads(msg.data)
+                except ValueError:
+                    continue
+                entry = self._filler_pending.get(str(data.get("request_id", "")))
+                if data.get("type") == "result" and entry and entry[0] is ws and not entry[1].done():
+                    entry[1].set_result(data)
+                elif data.get("type") == "status" and entry and entry[0] is ws:
+                    req = self.requests.get(str(data["request_id"]))
+                    if req is not None and data.get("detail"):
+                        req.detail = str(data["detail"])[:80]
+        finally:
+            if self.filler is ws:
+                self.filler = None
+            for rid, (owner, fut) in list(self._filler_pending.items()):
+                if owner is ws and not fut.done():
+                    fut.set_result({"status": L.FAILED, "detail": "gatehouse_app_disconnected"})
+        return ws
 
     def _recheck(self, req: LoginRequest, grant_id: str):
         """Re-validate a queued login once it holds the browser: it may have waited minutes behind

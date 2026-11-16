@@ -133,6 +133,26 @@ struct WebsiteDetail: View {
             }
 
             Section {
+                Toggle("Also allow in Safari", isOn: Binding(get: { account.allowSafari ?? false }, set: { on in
+                    Task { await model.setSafari(account, allowed: on) }
+                }))
+                .toggleStyle(.switch)
+                .disabled(account.origins.isEmpty)
+                if account.allowSafari == true && !SafariFiller.hasPermission {
+                    HStack {
+                        Label("Gatehouse needs Accessibility permission to type into Safari.", systemImage: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                        Spacer()
+                        Button("Open Settings") { SafariFiller.askForPermission() }
+                    }
+                }
+            } header: {
+                Text("Safari (for agents that control your screen)")
+            } footer: {
+                Text("Agents using computer use in Safari can ask Gatehouse to sign in there. Gatehouse opens the sign-in page and types the login itself, and the agent still never sees the password. The signed-in session then lives in your Safari, where anything controlling Safari can use it, so only turn this on where you need it.")
+            }
+
+            Section {
                 HStack {
                     Button("Edit…") { editing = true }
                     Spacer()

@@ -81,7 +81,7 @@ def overview(store: Store, vault: Vault, key: bytes, boot_id: str, handoffs: lis
     agents = {a["id"]: a["name"] for a in store.agents()}
     return {
         "accounts": [{**c.public(), "login_url": c.login_url, "imported_url": c.imported_url,
-                      "pre_click": list(c.pre_click), "success_selector": c.success_selector,
+                      "pre_click": list(c.pre_click), "success_selector": c.success_selector, "allow_safari": c.allow_safari,
                       "failures": store.failures(c.id), "updated_at": c.updated_at} for c in creds],
         "agents": [{"id": a["id"], "name": a["name"], "created_at": a["created_at"], "revoked_at": a["revoked_at"]}
                    for a in store.agents()],
@@ -147,6 +147,8 @@ def edit_account(store: Store, vault: Vault, key: bytes, p: dict) -> dict:
             cr.pre_click = [str(s) for s in p["pre_click"] or [] if s]
         if "success_selector" in p:
             cr.success_selector = str(p["success_selector"] or "")
+        if "allow_safari" in p:
+            cr.allow_safari = bool(p["allow_safari"])
         cr.updated_at = time.time()
     store.audit("account_edited", credential_id=cr.id)
     return {"account_id": cr.id}

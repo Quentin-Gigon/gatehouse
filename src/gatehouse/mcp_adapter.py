@@ -22,7 +22,8 @@ WAITING = ("in_progress", "human_verification_required")
 INSTRUCTIONS = """Gatehouse signs you in to websites the user has authorized, without ever showing you the password.
 
 - Call list_authorized_accounts to see which accounts you may use. If the account you need is not listed, ask the user to allow it in the Gatehouse app (Websites, then switch your app on); do not ask for the password.
-- Browse those sites only with the `gatehouse-browser` tools. They drive the browser that holds your signed-in sessions. Any other browser, including Safari or Chrome on the user's screen when you have computer use, is not signed in and never will be: do the signed-in part of the task in gatehouse-browser.
+- Browse those sites with the `gatehouse-browser` tools. They drive the browser that holds your signed-in sessions; other browsers are not signed in by request_login.
+- Exception, computer use in Safari: if you work by controlling the user's screen in Safari, call sign_in_in_safari instead. The Gatehouse app types the login into Safari for you; keep your hands off the keyboard and mouse until it returns. It only works for accounts the user allowed in Safari.
 - To sign in: open the site with gatehouse-browser, call request_login with the account_id, and on signed_in or already_signed_in continue in gatehouse-browser. The broker closes the browser connection while it types and your tabs are replaced by one signed-in tab; take a fresh snapshot before acting.
 - human_verification_required: the site wants a CAPTCHA or a code. Tell the user Gatehouse is waiting for them (the app shows a notification; in a terminal, `gatehouse-admin handoff`), then poll get_login_status.
 - permission_required: tell the user to open Gatehouse, Needs You, and allow or deny the request. login_failed or permission_denied: stop and tell the user; never retry login_failed.
@@ -41,6 +42,14 @@ TOOLS = [
      "inputSchema": {"type": "object", "required": ["account_id"], "properties": {
          "account_id": {"type": "string"}, "browser_session_id": {"type": "string", "description": "Defaults to your current browser session."},
          "wait_seconds": {"type": "number", "default": 60}}}},
+    {"name": "sign_in_in_safari",
+     "description": ("For agents that control the user's screen (computer use) and work in Safari. The Gatehouse app opens the "
+                     "account's sign-in page in a new Safari tab and types the credentials itself; you never see them. Do not "
+                     "touch the keyboard or mouse until this returns. Only works for accounts the user allowed in Safari and while "
+                     "the Gatehouse app is running. Returns signed_in, login_failed (do not retry; tell the user), "
+                     "unsupported_login_flow, permission_denied or permission_required. If a CAPTCHA appears on screen, ask the user to solve it."),
+     "inputSchema": {"type": "object", "required": ["account_id"], "properties": {
+         "account_id": {"type": "string"}, "wait_seconds": {"type": "number", "default": 120}}}},
     {"name": "get_login_status", "description": "Check a login request, e.g. while the user completes a CAPTCHA or MFA prompt.",
      "inputSchema": {"type": "object", "required": ["request_id"], "properties": {"request_id": {"type": "string"}}}},
     {"name": "logout",
@@ -63,6 +72,13 @@ class Adapter:
         if name == "request_login":
             _, r = self.c.call("/v1/login", {"account_id": args.get("account_id"), "browser_session_id": self._session(args)})
             end = time.time() + min(float(args.get("wait_seconds", 60)), 600)
+            while r.get("request_id") and r.get("status") == "in_progress" and time.time() < end:
+                time.sleep(1.0)
+                _, r = self.c.call("/v1/login/status", {"request_id": r["request_id"]})
+            return r
+        if name == "sign_in_in_safari":
+            _, r = self.c.call("/v1/safari/login", {"account_id": args.get("account_id")})
+            end = time.time() + min(float(args.get("wait_seconds", 120)), 600)
             while r.get("request_id") and r.get("status") == "in_progress" and time.time() < end:
                 time.sleep(1.0)
                 _, r = self.c.call("/v1/login/status", {"request_id": r["request_id"]})
