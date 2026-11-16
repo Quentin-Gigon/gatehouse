@@ -16,3 +16,4 @@ agent-*.json
 *.csv
 !examples/*.csv
 app/.build/
+.DS_Store
