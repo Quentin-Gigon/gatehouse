@@ -10,7 +10,7 @@
 #   gatehouse-admin approvals | approve ID --for ... | deny ID
 #   gatehouse-admin handoff        open the page for a sign-in waiting on a CAPTCHA or code
 #   gatehouse-admin import FILE.csv
-#   gatehouse-admin audit | status | logins disable|enable
+#   gatehouse-admin audit | status | selftest | logins disable|enable
 #   gatehouse-admin logs [N] | restart
 set -euo pipefail
 
@@ -19,11 +19,13 @@ STATE=@STATE@
 SVC=@SVC@
 LABEL=@LABEL@
 
-gh() {
+# From /, since the broker user cannot enter your current directory.
+gh() (
+  cd /
   sudo -u "$SVC" /usr/bin/env -i HOME="$STATE" GATEHOUSE_HOME="$STATE/home" GATEHOUSE_CHROME="$PREFIX/chrome/current" \
     GATEHOUSE_PASSPHRASE_FILE="$STATE/passphrase" PATH=/usr/bin:/bin LANG="${LANG:-en_US.UTF-8}" \
     "$PREFIX/venv/bin/gatehouse" "$@"
-}
+)
 
 case "${1:-}" in
   ""|-h|--help|help)

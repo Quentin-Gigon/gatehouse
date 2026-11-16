@@ -25,8 +25,20 @@ REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 INVOKER_HOME="$(dscl . -read "/Users/$SUDO_USER" NFSHomeDirectory | awk '{print $2}')"
 
 step() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
-as_svc() { sudo -u "$SVC" /usr/bin/env -i HOME="$STATE" GATEHOUSE_HOME="$STATE/home" \
-             GATEHOUSE_CHROME="$PREFIX/chrome/current" PATH=/usr/bin:/bin "$@"; }
+
+# This script runs as root from a folder your agents can write to. Know what you are installing.
+if [[ "${1:-}" != --yes ]]; then
+  rev="$(sudo -u "$SUDO_USER" git -C "$REPO" log -1 --format='%h %s' 2>/dev/null || echo 'not a git checkout')"
+  dirty="$(sudo -u "$SUDO_USER" git -C "$REPO" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+  echo "Installing Gatehouse as root from $REPO"
+  echo "  commit: $rev"
+  [[ "$dirty" == 0 ]] || echo "  WARNING: $dirty uncommitted change(s) in the checkout; review them (git -C $REPO diff) first"
+  read -r -p "Continue? [y/N] " ans
+  [[ "$ans" =~ ^[Yy] ]] || exit 1
+fi
+# From /, since the service user cannot enter the directory this script was started from.
+as_svc() ( cd / && sudo -u "$SVC" /usr/bin/env -i HOME="$STATE" GATEHOUSE_HOME="$STATE/home" \
+             GATEHOUSE_CHROME="$PREFIX/chrome/current" PATH=/usr/bin:/bin "$@" )
 
 # --- service account -------------------------------------------------------------
 step "Service account $SVC"
@@ -118,7 +130,12 @@ for l in "$LABEL" "$UPDATE_LABEL"; do
   render "$REPO/deploy/macos/$l.plist" > "/Library/LaunchDaemons/$l.plist"
   chown root:wheel "/Library/LaunchDaemons/$l.plist"; chmod 644 "/Library/LaunchDaemons/$l.plist"
   launchctl bootout "system/$l" 2>/dev/null || true
-  launchctl bootstrap system "/Library/LaunchDaemons/$l.plist"
+  # bootout returns before the old job is fully gone; bootstrap can fail briefly with "5: Input/output error"
+  for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    launchctl bootstrap system "/Library/LaunchDaemons/$l.plist" 2>/dev/null && break
+    [[ $attempt -lt 10 ]] || launchctl bootstrap system "/Library/LaunchDaemons/$l.plist"
+    sleep 1
+  done
   launchctl enable "system/$l"
 done
 for _ in $(seq 1 60); do
@@ -127,6 +144,12 @@ for _ in $(seq 1 60); do
 done
 if curl -s -o /dev/null "http://127.0.0.1:$PORT/"; then
   echo "broker running on 127.0.0.1:$PORT"
+  step "Self-test (starts the broker's browser once as $SVC)"
+  if ! as_svc "$PREFIX/venv/bin/gatehouse" --passphrase-file "$STATE/passphrase" selftest; then
+    echo "self-test failed; broker log:" >&2
+    tail -30 "$STATE/broker.log" >&2 || true
+    exit 1
+  fi
 else
   echo "broker did not come up; last log lines:" >&2
   tail -20 "$STATE/broker.log" >&2 || true

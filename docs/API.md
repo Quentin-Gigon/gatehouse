@@ -20,7 +20,7 @@ The adapter reads `GATEHOUSE_AGENT_CONFIG`, a JSON file `{"url", "agent_id", "si
 | `signed_in` | Login completed | Reconnect the browser tool and continue |
 | `already_signed_in` | A session was already there | Continue |
 | `in_progress` | Still working | Poll `get_login_status` |
-| `human_verification_required` | A person must finish a challenge in the browser window | Tell the user; poll |
+| `human_verification_required` | A person must finish a challenge | Tell the user to run `gatehouse-admin handoff`; poll |
 | `permission_required` | Grant expired, used up, or the site redirected to a website not approved | Tell the user; they run `gatehouse approvals` |
 | `permission_denied` | No grant, revoked, logins disabled, or unknown account | Stop |
 | `vault_locked` | Broker running without the vault key | Tell the user |
@@ -66,3 +66,9 @@ Behaviour: one login runs at a time per browser. A second `/v1/login` for the sa
 Tested with Playwright's `connect_over_cdp`. During a protected login the socket closes and reconnects get HTTP 423; reconnect after `signed_in`. After a login all previous tabs are gone and one tab holds the signed-in page.
 
 The token is a capability for that agent's browser. Treat it like a key; the broker's access log is disabled so it is not written to disk.
+
+After `signed_in`, the agent finds one tab: the signed-in page, freshly loaded. The tab in which the password was typed no longer exists.
+
+## Human handoff page
+
+`GET /handoff/<token>` is the only route meant for a person's browser. It serves a page that streams the login tab, and its WebSocket (`/handoff/<token>/ws`) carries the input. Tokens exist only while a login is in `human_verification_required` and are listed by `gatehouse handoff` (`gatehouse-admin handoff` in the service install). The first browser to open a link receives an HttpOnly, SameSite=Strict cookie; any other browser is refused. These routes accept an `Origin` header only when it equals the broker's own address.

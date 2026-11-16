@@ -28,9 +28,11 @@ Not considered: root or kernel compromise, a malicious Chromium build, physical 
 
 In same-user mode do not claim the agent cannot obtain passwords.
 
+In both modes, every agent runs as you. So one agent can read another agent's key file in `~/.config/gatehouse/` and act as that agent within that agent's grants. Agent identities separate grants and history; they are not a boundary between agents.
+
 ## What the agent can and cannot do
 
-Verified by tests in `tests/test_login_flow.py` and `tests/test_api.py` (Linux, Chrome 153):
+Verified by tests in `tests/test_login_flow.py`, `tests/test_attacks.py` and `tests/test_api.py` (macOS 27, Chrome 157):
 
 | Channel | During protected login | Otherwise |
 |---|---|---|
@@ -41,6 +43,8 @@ Verified by tests in `tests/test_login_flow.py` and `tests/test_api.py` (Linux, 
 | Screenshots, DOM evaluation | Impossible (no connection) | Allowed; the password field is blanked before handback |
 | Service worker planted on the site | Cleared for the account's websites before login | n/a |
 | Broker files | No access in dedicated-user mode | No access in dedicated-user mode |
+| The login tab | Never handed back. On success the signed-in URL is reopened in a new tab with a plain GET (query dropped if it looks single-use) and the login tab is destroyed, so back-navigation and reload cannot bring back the filled form or re-send its POST. Back/forward cache is off | n/a |
+| Revocation | `agent revoke` closes the agent's open relay connection within about 2 s and stops its browser | n/a |
 
 Relay filter (`cdp.py`): browser-level commands are allowlisted; `Tracing`, `Extensions`, `SystemInfo`, `Tethering`, certificate-error overrides, CSP bypass, `DOM.setFileInputFiles`, `Browser.close` and attaching to the browser target are refused; navigation commands accept only `http(s)` and `about:blank`.
 
@@ -48,7 +52,7 @@ Relay filter (`cdp.py`): browser-level commands are allowlisted; `Tracing`, `Ext
 
 - Websites are exact origins: scheme, host and port. No wildcards, no subdomain matching.
 - A use needs the origin on the account **and** on the grant.
-- The check runs in the page, in the same script that fills the field: top-level document on an allowed origin, form `action` on an allowed origin. A redirect to another origin ends the attempt with `permission_required` before anything is typed, and queues a request for you. Nothing on a page can approve it.
+- The check runs in the page, in the same script that fills the field: top-level document on an allowed origin, form `action` (and the submit button's `formaction`) on an allowed origin. That script runs in an isolated JavaScript world, so a page that redefines builtins (`Array.prototype.includes`, `JSON.stringify`, property setters) cannot change its outcome. The broker reads the tab's address from the browser's frame tree, not from page output. A redirect to another origin ends the attempt with `permission_required` before anything is typed, and queues a request for you. Nothing on a page can approve it.
 - Import never approves a website and never creates a grant.
 - Requests are HMAC-signed over method, path, timestamp, nonce and body; nonces are single-use. The relay and API reject any request carrying an `Origin` header or an unexpected `Host`, which blocks web pages and DNS rebinding.
 
@@ -56,12 +60,12 @@ Relay filter (`cdp.py`): browser-level commands are allowlisted; `Tracing`, `Ext
 
 1. **The session is the prize.** A signed-in agent can read session cookies through DevTools and act as you on that site for as long as the site honours them. On sites that allow it without re-authentication, that includes changing the password or email. Mitigate with narrow grants, sites' own session controls, and action-level approval in the agent harness.
 2. **Revocation is not logout.** Revoking a grant or agent does not end website sessions already established. `logout` removes local cookies and storage only.
-3. **The relay filter is partly a denylist.** Page-level DevTools commands not on the list are forwarded. A Chromium command that reads local files or persists across the gate, and that we failed to list, would be a hole. Dedicated-user mode limits what such a hole exposes to the broker user's files.
+3. **The relay filter is partly a denylist.** Browser-level commands, including every `Target.*` method, are on an explicit allowlist. Sessions are forced flat, so no command can be tunnelled past the filter, and `Target.sendMessageToTarget` is refused. Page-level DevTools commands not on the denylist are forwarded. A Chromium command that reads local files or persists across the gate, and that we failed to list, would be a hole. Dedicated-user mode limits what such a hole exposes to the broker user's files.
 4. **Persistent browser state.** Cookies, local storage and permissions the agent set before a login persist. The broker clears service workers, cache storage and the HTTP cache for the account's sites; other persistent mechanisms may exist.
 5. **The website sees the password.** So does any script the site loads. That is inherent in password login.
 6. **Heuristic success detection.** Without a `--success-selector`, "the password field is gone" counts as signed in. A page asking for push approval can look the same. Set a success selector for accounts that matter.
 7. **Heuristic field detection.** An unusual page could present a non-login field that looks like a username field; the username (not the password) could be typed into it. Password fields are matched by `type=password` only.
-8. **Human verification needs a visible browser.** The gate stays shut while you solve a challenge, up to a timeout. In headless mode challenges cannot be completed.
+8. **Human verification goes through a local page.** The service's browser is headless. The handoff page streams the login tab and replays your input, and the gate stays shut meanwhile (15 minutes in the service). Whoever holds the handoff link drives the login tab, including any "show password" control on the site. The link can only be read through `gatehouse-admin`, which needs your Mac password, and only the first browser to open it is admitted. In same-user mode an agent could read the link from `state.db`.
 9. **Signing keys at rest.** Agent signing keys are stored in `state.db` in clear (the daemon needs them to verify). Anyone who can read that file can impersonate agents, within those agents' grants.
 10. **Memory.** Python cannot reliably wipe strings. Decrypted credentials exist in daemon memory during a login and until garbage-collected; the vault key lives for the daemon's lifetime.
 11. **Chromium's own password manager** is disabled by preference and flags, not by policy. If it offered to save a password, a headful user could accept.
@@ -69,3 +73,5 @@ Relay filter (`cdp.py`): browser-level commands are allowlisted; `Tracing`, `Ext
 ## Authorization after login
 
 A grant covers signing in. It does not authorize actions inside the account, and the broker does not see or mediate them. Existing agreements in the agent harness still apply: sending email needs approval of exact recipients and content, purchases follow their own authorization, routine pre-authorized actions proceed. Gatehouse neither weakens nor enforces these.
+12. **The installer runs as root from your checkout.** Your agents can write to that folder. An agent that changes the code before you rerun `install.sh` would run as root, and then as the broker. The installer shows the commit and any uncommitted changes and asks before proceeding; review changes you did not make.
+13. **Headless fingerprint.** The service's Chrome presents a regular desktop user agent and window size and hides `navigator.webdriver`, which avoids the most common bot checks. Sophisticated bot detection can still tell, and will show a CAPTCHA, which you solve through the handoff.

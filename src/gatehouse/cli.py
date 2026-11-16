@@ -134,6 +134,30 @@ def cmd_serve(c: Ctx) -> None:
         pass
 
 
+def cmd_selftest(c: Ctx) -> None:
+    """Ask the running broker for a browser through a throwaway agent, so a broken install shows now
+    and not on an agent's first sign-in."""
+    from .client import BrokerClient
+    s = c.store
+    if not s.get_setting("boot_id"):
+        die("the broker is not running")
+    a = s.add_agent("selftest")
+    try:
+        client = BrokerClient(f"http://127.0.0.1:{s.get_setting('port', str(DEFAULT_PORT))}", a["agent_id"], a["sign_key"])
+        try:
+            _, acc = client.call("/v1/accounts")
+            _, br = client.call("/v1/browser")
+        except OSError as e:
+            die(f"broker unreachable: {e}")
+        print(f"broker:  running")
+        print(f"vault:   {'unlocked' if acc.get('status') == 'ok' else acc.get('status')}")
+        print(f"browser: {'starts' if br.get('status') == 'ok' else br.get('status')}")
+        if acc.get("status") != "ok" or br.get("status") != "ok":
+            raise SystemExit(1)
+    finally:
+        s.revoke_agent(a["agent_id"])
+
+
 def cmd_status(c: Ctx) -> None:
     s = c.store
     print(f"home:            {c.paths.home}")
@@ -463,6 +487,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     add(sub, "init", cmd_init, "create the vault")
     add(sub, "status", cmd_status, "show broker state")
+    add(sub, "selftest", cmd_selftest, "check that the running broker can unlock the vault and start a browser")
     sp = add(sub, "serve", cmd_serve, "run the broker")
     sp.add_argument("--port", type=int, default=DEFAULT_PORT)
     sp.add_argument("--headless", action="store_true", help="no browser window (human verification becomes impossible)")

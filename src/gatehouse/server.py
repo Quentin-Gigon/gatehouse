@@ -89,8 +89,21 @@ class Broker:
         self.store.set_setting("handoffs", "[]")
         self.store.prune_audit()
         self.store.audit("broker_started", result="unlocked" if self.key else "locked")
+        self._reaper = asyncio.create_task(self._reap_revoked())
+
+    async def _reap_revoked(self) -> None:
+        """Shut down the browsers of agents that have been revoked."""
+        while True:
+            await asyncio.sleep(REVOKE_POLL * 5)
+            for agent_id, b in list(self.browsers.items()):
+                row = self.store.agent(agent_id)
+                if (row is None or row["revoked_at"] is not None) and not b.lock.locked():
+                    self.browsers.pop(agent_id, None)
+                    self.session_ids.pop(agent_id, None)
+                    await b.stop()
 
     async def _on_stop(self, app) -> None:
+        self._reaper.cancel()
         self.store.set_setting("boot_id", "")
         self.store.set_setting("handoffs", "[]")
         for req in self.requests.values():
@@ -164,7 +177,7 @@ class Broker:
     async def h_browser(self, agent_id: str, p: dict) -> dict:
         try:
             b = await self.browser_for(agent_id)
-        except CDPError:
+        except (CDPError, OSError):
             return {"status": "browser_unavailable"}
         return {"status": "ok", "browser_session_id": self.session_ids[agent_id], "gate_open": b.gate_open}
 
