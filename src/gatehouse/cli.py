@@ -427,8 +427,9 @@ def cmd_handoff(c: Ctx) -> None:
     names = {x.id: x.name for x in c.vault.load(c.key)}
     for h in pending:
         print(f"{names.get(h['account_id'], h['account_id'])} on {h['origin']} (agent {h['agent_id']}, "
-              f"waiting since {when(h['created_at'])}):\n  http://127.0.0.1:{port}/handoff/{h['token']}")
-    print("Open the link in your browser. The first browser to open it is the only one that can use it.")
+              f"waiting since {when(h['created_at'])}):\n  link: http://127.0.0.1:{port}/handoff/{h['token']}\n"
+              f"  code: {h['code']}")
+    print("Open the link and enter the code. The code is shown only here; never paste it anywhere else.")
 
 
 def cmd_approve(c: Ctx) -> None:

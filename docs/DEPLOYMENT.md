@@ -95,7 +95,7 @@ Set a success selector for accounts that matter. With it, "signed in" means the 
 
 The broker's browser has no window. When a site asks for a human, the agent gets `human_verification_required` and tells you to run `gatehouse-admin handoff`.
 
-That command opens a page on `127.0.0.1` that shows the sign-in tab live. Your clicks, typing and pastes are sent to it. Agents cannot open that page: the link is readable only through `gatehouse-admin`, and only the first browser to open it can use it.
+That command opens a page on `127.0.0.1` that shows the sign-in tab live. Your clicks, typing and pastes are sent to it. The page first asks for a code that `gatehouse-admin handoff` prints only in your terminal, so the link alone is useless to an agent. Five wrong codes kill the link (it is logged and a new one is issued). The browser that enters the right code is the only one admitted.
 
 The sign-in waits up to 15 minutes, then fails with `human_verification_timeout`.
 

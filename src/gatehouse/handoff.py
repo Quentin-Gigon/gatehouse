@@ -4,7 +4,10 @@ The broker's browser may be headless or belong to another macOS user, so the per
 cannot simply look at it. While a login waits for a human, the broker streams the
 login tab as screenshots to a local page and replays the person's mouse and keyboard
 into it. The page is reached through a one-time link that only the management CLI can
-read; the first browser to open it gets a cookie and is the only one let in after that.
+read. The link alone is not enough: the page asks for a short code that the CLI shows only
+in the person's terminal (the link itself can leak, e.g. through `open`'s process
+arguments, which other processes of the same user can see). The browser that enters the
+code gets a cookie and is the only one let in after that; too many wrong codes kill the link.
 The gate stays shut throughout: agents see nothing of this.
 """
 from __future__ import annotations
@@ -18,6 +21,12 @@ import time
 from .cdp import Browser, CDPError
 
 MAX_TEXT = 512
+MAX_CODE_ATTEMPTS = 5
+_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+
+def _norm(code: str) -> str:
+    return "".join(ch for ch in str(code).upper() if ch.isalnum())[:16]
 MOUSE_TYPES = {"mousePressed", "mouseReleased", "mouseMoved"}
 BUTTONS = {"none", "left", "middle", "right"}
 
@@ -26,6 +35,8 @@ class Handoff:
     def __init__(self, request_id: str, agent_id: str, account_id: str, origin: str, browser: Browser, session_id: str):
         self.token = secrets.token_urlsafe(24)
         self.cookie: str | None = None
+        self.code = "".join(secrets.choice(_CODE_ALPHABET) for _ in range(8))
+        self.attempts = 0
         self.request_id, self.agent_id, self.account_id, self.origin = request_id, agent_id, account_id, origin
         self.b, self.sid = browser, session_id
         self.created_at = time.time()
@@ -34,15 +45,27 @@ class Handoff:
         self._size = (1280.0, 900.0)
 
     def public(self) -> dict:
-        return {"token": self.token, "request_id": self.request_id, "agent_id": self.agent_id,
+        return {"token": self.token, "code": f"{self.code[:4]}-{self.code[4:]}", "request_id": self.request_id,
+                "agent_id": self.agent_id,
                 "account_id": self.account_id, "origin": self.origin, "created_at": self.created_at}
 
-    def claim(self, cookie: str | None) -> str | None:
-        """Return the cookie to set on first open, '' if this browser already holds it, None if refused."""
-        if self.cookie is None:
-            self.cookie = secrets.token_urlsafe(24)
-            return self.cookie
-        return "" if cookie and hmac.compare_digest(cookie, self.cookie) else None
+    @property
+    def claimed(self) -> bool:
+        return self.cookie is not None
+
+    def claim(self, code: str) -> str | None:
+        """Exchange the terminal code for the viewer cookie, once. None if wrong or already claimed."""
+        if self.cookie is not None or self.attempts >= MAX_CODE_ATTEMPTS:
+            return None
+        if not hmac.compare_digest(_norm(code).encode(), self.code.encode()):
+            self.attempts += 1
+            return None
+        self.cookie = secrets.token_urlsafe(24)
+        return self.cookie
+
+    @property
+    def locked_out(self) -> bool:
+        return self.cookie is None and self.attempts >= MAX_CODE_ATTEMPTS
 
     def admits(self, cookie: str | None) -> bool:
         return bool(self.cookie and cookie and hmac.compare_digest(cookie, self.cookie))
@@ -199,3 +222,22 @@ PAGE = """<!doctype html>
 GONE = """<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Gatehouse verification</title>
 <style>body{font:16px/1.5 -apple-system,sans-serif;margin:48px;color:#333}@media(prefers-color-scheme:dark){body{background:#18181a;color:#ddd}}</style>
 </head><body><p>__MESSAGE__</p></body></html>"""
+
+CODE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gatehouse verification</title>
+<style>
+  :root { --bg: #f6f6f4; --fg: #1d1d1b; --muted: #6b6b66; --line: #d9d9d4; --err: #b42318; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #18181a; --fg: #ececea; --muted: #9a9a95; --line: #333336; --err: #f97066; } }
+  body { margin: 0; font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif; background: var(--bg); color: var(--fg); }
+  main { max-width: 34rem; margin: 64px auto; padding: 0 16px; }
+  h1 { font-size: 18px; } p { color: var(--muted); }
+  input { font: 20px ui-monospace, Menlo, monospace; letter-spacing: 0.15em; padding: 8px 10px; width: 12ch; text-transform: uppercase;
+          border: 1px solid var(--line); border-radius: 6px; background: transparent; color: var(--fg); }
+  button { font: inherit; padding: 9px 16px; margin-left: 8px; border-radius: 6px; border: 1px solid var(--line); background: var(--fg); color: var(--bg); }
+  .err { color: var(--err); }
+</style></head><body><main>
+<h1>Finish signing in to __ORIGIN__</h1>
+<p>Enter the code that <code>gatehouse-admin handoff</code> printed in your terminal.</p>
+__ERROR__
+<form method="post" action="__ACTION__"><input name="code" autocomplete="off" autofocus maxlength="12" placeholder="XXXX-XXXX" aria-label="Code"><button>Continue</button></form>
+</main></body></html>"""

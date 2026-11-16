@@ -242,9 +242,16 @@ async def test_human_handoff_page_streams_and_replays_input(env):
 
     jar = aiohttp.CookieJar(unsafe=True)                         # browsers keep cookies for 127.0.0.1
     async with aiohttp.ClientSession(cookie_jar=jar) as viewer, aiohttp.ClientSession() as other:
-        async with viewer.get(base) as resp:                     # first browser claims the link
-            assert resp.status == 200 and "gh_handoff" in resp.cookies
-        async with other.get(base) as resp:                      # any other browser is refused
+        async with other.get(base) as resp:                      # the link alone shows only a code prompt
+            assert resp.status == 200 and "gh_handoff" not in resp.cookies and "code" in await resp.text()
+        async with other.get(base + "/ws") as resp:
+            assert resp.status == 403
+        async with other.post(base + "/claim", data={"code": "WRONG-CODE"}) as resp:
+            assert resp.status == 403
+        async with viewer.post(base + "/claim", data={"code": handoff["code"].lower()},
+                               headers={"Origin": f"http://127.0.0.1:{env.port}"}) as resp:
+            assert resp.status == 200 and "Gatehouse: finish signing in" in await resp.text()   # 303 → live page
+        async with other.get(base) as resp:                      # once claimed, any other browser is refused
             assert resp.status == 403
         async with other.get(base + "/ws") as resp:
             assert resp.status == 403
@@ -266,3 +273,22 @@ async def test_human_handoff_page_streams_and_replays_input(env):
     assert json.loads(env.store.get_setting("handoffs")) == []
     async with env.http.get(base) as resp:                        # link is dead once the sign-in moves on
         assert resp.status == 404
+
+
+async def test_handoff_link_dies_after_wrong_codes_and_is_replaced(env):
+    cid = env.add_account("/captcha-login")
+    env.grant(cid)
+    sid = await env.session_id()
+    _, r = await env.api("/v1/login", {"account_id": cid, "browser_session_id": sid})
+    assert (await _wait_status(env, r["request_id"], L.HUMAN))["status"] == L.HUMAN
+    [first] = json.loads(env.store.get_setting("handoffs"))
+    base = f"http://127.0.0.1:{env.port}/handoff/{first['token']}"
+    for _ in range(5):
+        async with env.http.post(base + "/claim", data={"code": "AAAA-AAAA"}) as resp:
+            assert resp.status == 403
+    async with env.http.post(base + "/claim", data={"code": first["code"]}) as resp:   # even the right code is too late
+        assert resp.status == 404
+    [second] = json.loads(env.store.get_setting("handoffs"))
+    assert second["token"] != first["token"] and second["request_id"] == r["request_id"]
+    assert any(row["action"] == "handoff_claim_refused" for row in env.store.audit_rows(50))
+    await env.api("/v1/login/cancel", {"request_id": r["request_id"]})

@@ -14,7 +14,7 @@ from aiohttp import web
 
 from . import login as L
 from .cdp import Browser, CDPError
-from .handoff import GONE, PAGE, Handoff
+from .handoff import CODE_PAGE, GONE, PAGE, Handoff
 from .config import Paths
 from .origins import origin_of
 from .policy import authorize, visible_accounts
@@ -79,6 +79,7 @@ class Broker:
         r.add_get("/handoff/{token}", self.h_handoff_page)
         r.add_get("/handoff/{token}/", self.h_handoff_page)
         r.add_get("/handoff/{token}/ws", self.h_handoff_ws)
+        r.add_post("/handoff/{token}/claim", self.h_handoff_claim)
         app.on_startup.append(self._on_start)
         app.on_cleanup.append(self._on_stop)
         return app
@@ -334,7 +335,7 @@ class Broker:
         return web.Response(text=body, content_type="text/html", status=status, headers={
             "Cache-Control": "no-store", "Referrer-Policy": "no-referrer", "X-Frame-Options": "DENY",
             "Content-Security-Policy": "default-src 'none'; img-src data:; style-src 'unsafe-inline'; "
-                                       "script-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'",
+                                       "script-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'",
             **headers})
 
     async def h_handoff_page(self, request: web.Request):
@@ -342,14 +343,45 @@ class Broker:
         if h is None:
             return self._html(GONE.replace("__MESSAGE__", "This verification link has expired or the sign-in has "
                                            "already finished. Run <code>gatehouse-admin handoff</code> for a current one."), 404)
-        cookie = h.claim(request.cookies.get("gh_handoff"))
-        if cookie is None:
+        origin = h.origin.replace("&", "&amp;").replace("<", "&lt;")
+        if h.admits(request.cookies.get("gh_handoff")):
+            return self._html(PAGE.replace("__ORIGIN__", origin))
+        if h.claimed:
             return self._html(GONE.replace("__MESSAGE__", "This link was already opened in another browser. "
                                            "Use that browser, or wait for the next verification request."), 403)
-        resp = self._html(PAGE.replace("__ORIGIN__", h.origin.replace("&", "&amp;").replace("<", "&lt;")))
-        if cookie:
-            resp.set_cookie("gh_handoff", cookie, path=f"/handoff/{h.token}", httponly=True, samesite="Strict")
-        return resp
+        return self._code_page(h, "")
+
+    def _code_page(self, h: Handoff, error: str, status: int = 200) -> web.Response:
+        return self._html(CODE_PAGE.replace("__ORIGIN__", h.origin.replace("&", "&amp;").replace("<", "&lt;"))
+                          .replace("__ACTION__", f"/handoff/{h.token}/claim")
+                          .replace("__ERROR__", f'<p class="err">{error}</p>' if error else ""), status)
+
+    async def h_handoff_claim(self, request: web.Request):
+        h = self._handoff(request)
+        if h is None:
+            return self._html(GONE.replace("__MESSAGE__", "This verification link has expired."), 404)
+        form = await request.post()
+        cookie = h.claim(str(form.get("code", "")))
+        if cookie is None:
+            self.store.audit("handoff_claim_refused", h.agent_id, h.account_id, h.origin, "denied",
+                             "locked" if h.locked_out else "wrong_code")
+            if h.locked_out:
+                # Someone is guessing. Kill this link; the login keeps waiting under a new one.
+                self.handoffs.pop(h.token, None)
+                h.close()
+                req = self.requests.get(h.request_id)
+                if req is not None and h.sid:
+                    self._open_handoff(req, h.b, h.sid)
+                self._publish_handoffs()
+                return self._html(GONE.replace("__MESSAGE__", "Too many wrong codes; this link is dead. Run "
+                                               "<code>gatehouse-admin handoff</code> again for a new link and code."), 403)
+            if h.claimed:
+                return self._html(GONE.replace("__MESSAGE__", "This link was already opened in another browser."), 403)
+            return self._code_page(h, "That code is not right. Check the terminal and try again.", 403)
+        self.store.audit("handoff_claimed", h.agent_id, h.account_id, h.origin, "allowed")
+        resp = web.HTTPSeeOther(f"/handoff/{h.token}")
+        resp.set_cookie("gh_handoff", cookie, path=f"/handoff/{h.token}", httponly=True, samesite="Strict")
+        raise resp
 
     async def h_handoff_ws(self, request: web.Request):
         h = self._handoff(request)
