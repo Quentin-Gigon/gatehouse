@@ -38,7 +38,10 @@ Run these as yourself, without sudo:
 ```sh
 gatehouse-connect claude-code     # Claude Code (CLI and desktop)
 gatehouse-connect codex           # Codex (CLI and app)
+gatehouse-connect claude-desktop  # Claude Desktop app chats (quit and reopen the app afterwards)
 ```
+
+The Claude Desktop app's Code tab uses Claude Code's configuration, so `claude-code` covers it. Its chats read `~/Library/Application Support/Claude/claude_desktop_config.json`; `claude-desktop` adds the two servers there and keeps a `.bak` of the previous file.
 
 Each command does four things:
 
