@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>@LABEL@</string>
+  <key>UserName</key><string>@SVC@</string>
+  <key>GroupName</key><string>@SVC@</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@PREFIX@/venv/bin/gatehouse</string>
+    <string>--passphrase-file</string><string>@STATE@/passphrase</string>
+    <string>serve</string>
+    <string>--headless</string>
+    <string>--port</string><string>@PORT@</string>
+    <string>--human-timeout</string><string>900</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>@STATE@</string>
+    <key>GATEHOUSE_HOME</key><string>@STATE@/home</string>
+    <key>GATEHOUSE_CHROME</key><string>@PREFIX@/chrome/current</string>
+    <key>PATH</key><string>/usr/bin:/bin</string>
+    <key>PYTHONUNBUFFERED</key><string>1</string>
+  </dict>
+  <key>WorkingDirectory</key><string>@STATE@</string>
+  <key>Umask</key><integer>63</integer>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>@STATE@/broker.log</string>
+  <key>StandardErrorPath</key><string>@STATE@/broker.log</string>
+</dict>
+</plist>

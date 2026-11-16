@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>@UPDATE_LABEL@</string>
+  <key>ProgramArguments</key>
+  <array><string>@PREFIX@/bin/update-chrome</string></array>
+  <key>StartCalendarInterval</key>
+  <dict><key>Weekday</key><integer>0</integer><key>Hour</key><integer>4</integer><key>Minute</key><integer>17</integer></dict>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>/var/log/gatehouse-chrome-update.log</string>
+  <key>StandardErrorPath</key><string>/var/log/gatehouse-chrome-update.log</string>
+</dict>
+</plist>

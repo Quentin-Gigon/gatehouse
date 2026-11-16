@@ -142,7 +142,8 @@ class Browser:
         args = [self.chrome, "--remote-debugging-pipe", f"--user-data-dir={self.profile_dir}",
                 "--no-first-run", "--no-default-browser-check", "--disable-extensions",
                 "--disable-sync", "--disable-background-networking", "--password-store=basic",
-                "--use-mock-keychain", "--disable-features=PasswordManagerOnboarding,AutofillServerCommunication",
+                "--use-mock-keychain",
+                "--disable-features=PasswordManagerOnboarding,AutofillServerCommunication,BackForwardCache",
                 "--disable-blink-features=AutomationControlled",
                 *(self._headless_args() if self.headless else ()), *self.extra_args, "about:blank"]
         # Chromium expects the pipe on descriptors 3 (read) and 4 (write). A tiny trampoline

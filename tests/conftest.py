@@ -42,6 +42,7 @@ class Env:
         self.origin = f"http://127.0.0.1:{self.port_a}"
         self.other = f"http://127.0.0.1:{self.port_b}"
         self.site.other_origin = self.other
+        self.site.approved = self.origin
         self.vault = Vault(self.paths.vault)
         self.key = self.vault.create(PASSPHRASE, n=2 ** 12)
 

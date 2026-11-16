@@ -1,0 +1,80 @@
+#!/bin/bash
+# Manage Gatehouse: accounts, grants, approvals, CAPTCHA handoffs, history.
+#
+# Runs the gatehouse CLI as the broker's own user (@SVC@) through sudo, so it asks for
+# your Mac password. That password is what keeps agents, which run as you, from
+# granting themselves access.
+#
+#   gatehouse-admin account add | list | edit | remove | unblock
+#   gatehouse-admin grant add --agent NAME --account NAME --for once|session|forever|YYYY-MM-DD
+#   gatehouse-admin approvals | approve ID --for ... | deny ID
+#   gatehouse-admin handoff        open the page for a sign-in waiting on a CAPTCHA or code
+#   gatehouse-admin import FILE.csv
+#   gatehouse-admin audit | status | logins disable|enable
+#   gatehouse-admin logs [N] | restart
+set -euo pipefail
+
+PREFIX=@PREFIX@
+STATE=@STATE@
+SVC=@SVC@
+LABEL=@LABEL@
+
+gh() {
+  sudo -u "$SVC" /usr/bin/env -i HOME="$STATE" GATEHOUSE_HOME="$STATE/home" GATEHOUSE_CHROME="$PREFIX/chrome/current" \
+    GATEHOUSE_PASSPHRASE_FILE="$STATE/passphrase" PATH=/usr/bin:/bin LANG="${LANG:-en_US.UTF-8}" \
+    "$PREFIX/venv/bin/gatehouse" "$@"
+}
+
+case "${1:-}" in
+  ""|-h|--help|help)
+    sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+    echo; gh --help | sed -n '/^positional/,$p' ;;
+  handoff)
+    shift
+    gh handoff "$@"
+    if [[ " $* " != *" --urls "* ]]; then
+      gh handoff --urls | while read -r url; do open "$url"; done
+    fi ;;
+  import)
+    file="${2:?usage: gatehouse-admin import FILE.csv}"
+    [[ -r "$file" ]] || { echo "cannot read $file" >&2; exit 1; }
+    copy="$STATE/import-$$.csv"
+    # The broker user cannot read your files; hand it a private copy and always remove it.
+    sudo -u "$SVC" /bin/sh -c 'umask 077; cat > "$0"' "$copy" < "$file"
+    trap 'sudo -u "$SVC" /bin/rm -f "$copy"' EXIT
+    gh import --keep-file "$copy"
+    read -r -p "Delete the export file $file now? [y/N]: " ans
+    if [[ "$ans" =~ ^[Yy] ]]; then
+      rm -P "$file" 2>/dev/null || rm -f "$file"
+      echo "Deleted. On SSDs and synced folders older copies may persist."
+    fi ;;
+  agent)
+    if [[ "${2:-}" == add ]]; then
+      echo "Use gatehouse-connect NAME to register an agent: it stores the agent's keys in your account" >&2
+      echo "and wires its tools into Claude Code / Codex." >&2
+      exit 2
+    fi
+    gh "$@" ;;
+  agent-json)
+    # For gatehouse-connect: register NAME, or issue new keys if it exists (its grants stay), as JSON.
+    name="${2:?usage: gatehouse-admin agent-json NAME}"
+    if gh agent list | awk -v n="$name" '$2 == n && $NF == "active" {found=1} END {exit !found}'; then
+      gh agent rotate "$name" --write-config -
+    else
+      gh agent add "$name" --write-config -
+    fi ;;
+  logs)
+    sudo tail -n "${2:-100}" "$STATE/broker.log" ;;
+  restart)
+    sudo launchctl kickstart -k "system/$LABEL" && echo "Broker restarted." ;;
+  status)
+    gh status
+    if launchctl print "system/$LABEL" >/dev/null 2>&1; then
+      echo "service:         loaded ($(launchctl print "system/$LABEL" | awk -F'= ' '/^\tstate/ {print $2; exit}'))"
+    else
+      echo "service:         not loaded (sudo launchctl bootstrap system /Library/LaunchDaemons/$LABEL.plist)"
+    fi
+    echo "browser:         $("$PREFIX/chrome/current" --version 2>/dev/null || echo missing)" ;;
+  *)
+    gh "$@" ;;
+esac

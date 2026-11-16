@@ -2,8 +2,15 @@
 
 Runs only while the gate is closed. Every script that touches a field first
 checks, in the same JavaScript turn, that the top-level document is on an
-authorized origin and that the form posts to one. Secrets go to the browser
-over the debugging pipe and nowhere else; statuses and details are fixed words.
+authorized origin and that the form posts to one. Those scripts run in an
+isolated JavaScript world, so nothing the page defines (a patched
+Array.prototype.includes, JSON.stringify, property setters) can change what
+they see or do. Secrets go to the browser over the debugging pipe and nowhere
+else; statuses and details are fixed words.
+
+The login tab is never handed to an agent: its history holds the filled form
+(back/forward cache) and possibly the form POST (reload re-sends it). On success
+the signed-in page is opened afresh in a new tab and the login tab is destroyed.
 """
 from __future__ import annotations
 
@@ -11,6 +18,7 @@ import asyncio
 import json
 import time
 from dataclasses import dataclass
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from . import totp as totp_mod
 from .cdp import Browser, CDPError
@@ -77,6 +85,9 @@ _SUBMIT = "((allowed, kind) => {" + _LIB + r"""
   const form = el.form;
   if (!form) { el.focus(); return 'enter'; }
   const btn = [...form.querySelectorAll('button[type=submit],input[type=submit],button:not([type])')].filter(vis)[0];
+  if (btn && btn.hasAttribute('formaction')) {
+    try { if (!allowed.includes(new URL(btn.formAction, location.href).origin)) return 'form_action_mismatch'; }
+    catch (e) { return 'form_action_mismatch'; } }
   if (btn) btn.click(); else if (form.requestSubmit) form.requestSubmit(); else form.submit();
   return 'ok';
 })"""
@@ -98,6 +109,11 @@ class Timeouts:
     step: float = 20.0
     human: float = 300.0
     settle: float = 0.6
+    script: float = 5.0      # one evaluation; a page that blocks its main thread longer is given up on
+
+
+# Query parameters that make a post-login URL single-use or sensitive; dropped before it is reopened.
+_SENSITIVE_PARAMS = ("code", "token", "ticket", "state", "session", "auth", "sig", "nonce", "otp", "password", "key")
 
 
 class _Abort(Exception):
@@ -116,22 +132,55 @@ class LoginRun:
         self.sid: str | None = None
         self.target: str | None = None
         self.unapproved_origin: str | None = None
+        self.final_url: str | None = None
+        self.handback_target: str | None = None
 
-    async def _eval(self, fn: str, *args, retries: int = 20):
+    def _on_event(self, msg: dict) -> None:
+        # A dialog (alert, beforeunload) would block every script and the tab close; dismiss it.
+        if msg.get("sessionId") == self.sid and msg.get("method") == "Page.javascriptDialogOpening":
+            asyncio.ensure_future(self._dismiss_dialog())
+
+    async def _dismiss_dialog(self) -> None:
+        try:
+            await self.b.call("Page.handleJavaScriptDialog", {"accept": True}, self.sid, timeout=5)
+        except CDPError:
+            pass
+
+    async def _eval(self, fn: str, *args, deadline: float | None = None):
+        """Evaluate in a fresh isolated world of the tab's main frame. The page cannot reach that world."""
         expr = f"{fn}({', '.join(json.dumps(a) for a in args)})"
-        for _ in range(retries):
+        end = time.monotonic() + (deadline if deadline is not None else self.t.step)
+        while True:
             try:
-                r = await self.b.call("Runtime.evaluate", {"expression": expr, "returnByValue": True}, self.sid)
-            except CDPError:
-                await asyncio.sleep(0.25)  # execution context replaced by a navigation
+                tree = await self.b.call("Page.getFrameTree", {}, self.sid, timeout=self.t.script)
+                world = await self.b.call("Page.createIsolatedWorld", {
+                    "frameId": tree["frameTree"]["frame"]["id"], "worldName": "gatehouse",
+                    "grantUniveralAccess": False}, self.sid, timeout=self.t.script)
+                r = await self.b.call("Runtime.evaluate", {"expression": expr, "returnByValue": True,
+                                                           "contextId": world["executionContextId"]},
+                                      self.sid, timeout=self.t.script)
+            except CDPError as e:
+                if "timed out" in str(e):
+                    raise _Abort(FAILED, "page_unresponsive") from None
+                if time.monotonic() > end:
+                    raise _Abort(FAILED, "page_unresponsive") from None
+                await asyncio.sleep(0.25)  # the document was replaced by a navigation; try the new one
                 continue
             if "exceptionDetails" in r:
                 raise _Abort(UNSUPPORTED, "script_error")
             return r["result"].get("value")
-        raise _Abort(FAILED, "page_unresponsive")
+
+    async def _main_frame_url(self) -> str:
+        """The tab's URL as the browser itself reports it, not as page script would."""
+        tree = await self.b.call("Page.getFrameTree", {}, self.sid, timeout=self.t.script)
+        return tree["frameTree"]["frame"].get("url", "")
 
     async def _state(self) -> dict:
-        return json.loads(await self._eval(_STATE, self.cred.success_selector or ""))
+        st = json.loads(await self._eval(_STATE, self.cred.success_selector or ""))
+        # Trust the browser, not the document, for where the tab is.
+        url = await self._main_frame_url()
+        st["origin"], st["href"] = origin_of(url) or "null", url
+        return st
 
     async def _wait_ready(self, timeout: float) -> dict:
         end = time.monotonic() + timeout
@@ -179,6 +228,7 @@ class LoginRun:
 
     async def open_tab(self) -> None:
         """Create the login tab, then close every other tab and clear what could carry planted code."""
+        self.b.add_listener(self._on_event)
         self.target = (await self.b.call("Target.createTarget", {"url": "about:blank"}))["targetId"]
         self.sid = (await self.b.call("Target.attachToTarget", {"targetId": self.target, "flatten": True}))["sessionId"]
         for t in (await self.b.call("Target.getTargets"))["targetInfos"]:
@@ -200,15 +250,21 @@ class LoginRun:
 
     async def run(self) -> tuple[str, str]:
         try:
-            return await self._run()
+            status, detail = await self._run()
         except _Abort as a:
             return a.status, a.detail
         except CDPError:
             return FAILED, "browser_error"
+        try:
+            self.final_url = await self._main_frame_url()
+        except CDPError:
+            self.final_url = None
+        return status, detail
 
     async def _run(self) -> tuple[str, str]:
         cred = self.cred
         await self.b.call("Page.enable", {}, self.sid)
+        await self.b.call("Runtime.enable", {}, self.sid)
         nav = await self.b.call("Page.navigate", {"url": cred.login_url}, self.sid, timeout=self.t.navigation)
         if nav.get("errorText"):
             raise _Abort(FAILED, "navigation_error")
@@ -273,20 +329,55 @@ class LoginRun:
                 raise _Abort(UNSUPPORTED, "no_login_form_found")
         raise _Abort(UNSUPPORTED, "too_many_steps")
 
-    async def finish(self, keep_tab: bool) -> None:
-        """Leave the browser safe to hand back: no secret in the DOM, no broker session attached."""
+    async def finish(self, signed_in: bool) -> bool:
+        """Make the browser safe to hand back. Returns False if the login tab could not be destroyed,
+        in which case the caller must not reopen the gate on this browser.
+
+        The agent gets a new tab: on the signed-in page (fetched afresh with a plain GET) after a
+        successful login, blank otherwise. The login tab, with its history, is destroyed."""
+        url = "about:blank"
+        if signed_in and self.final_url and origin_of(self.final_url) in self.allowed:
+            url = _reopenable(self.final_url)
         try:
-            if keep_tab:
-                await self._eval(_SCRUB, retries=3)
-            else:
-                await self.b.call("Target.createTarget", {"url": "about:blank"})
-                await self.b.call("Target.closeTarget", {"targetId": self.target}, timeout=5)
-        except (CDPError, _Abort):
-            pass
-        try:
-            await self.b.call("Target.detachFromTarget", {"sessionId": self.sid}, timeout=5)
+            self.handback_target = (await self.b.call("Target.createTarget", {"url": url}, timeout=10))["targetId"]
         except CDPError:
             pass
+        if self.target is None:
+            self.b.remove_listener(self._on_event)
+            return True
+        try:
+            await self._eval(_SCRUB, deadline=2)
+        except (CDPError, _Abort):
+            pass
+        gone = await self._close_login_tab()
+        self.b.remove_listener(self._on_event)
+        return gone
+
+    async def _close_login_tab(self) -> bool:
+        for attempt in range(3):
+            try:
+                if attempt == 2:
+                    await self.b.call("Page.crash", {}, self.sid, timeout=3)  # last resort: kill its renderer
+                await self.b.call("Target.closeTarget", {"targetId": self.target}, timeout=5)
+            except CDPError:
+                pass
+            for _ in range(20):
+                try:
+                    infos = (await self.b.call("Target.getTargets", timeout=5))["targetInfos"]
+                except CDPError:
+                    return False
+                if all(t["targetId"] != self.target for t in infos):
+                    return True
+                await asyncio.sleep(0.1)
+        return False
+
+
+def _reopenable(url: str) -> str:
+    """The signed-in URL without fragment, and without its query if that looks single-use or sensitive."""
+    parts = urlsplit(url)
+    names = [k.lower() for k, _ in parse_qsl(parts.query, keep_blank_values=True)]
+    query = "" if any(n.startswith(p) or n.endswith(p) for n in names for p in _SENSITIVE_PARAMS) else parts.query
+    return urlunsplit((parts.scheme, parts.netloc, parts.path or "/", query, ""))
 
 
 async def clear_site_session(browser: Browser, origins: list[str]) -> None:

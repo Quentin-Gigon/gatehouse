@@ -1,0 +1,84 @@
+#!/bin/bash
+# Install or refresh the broker's private browser, then restart the broker if it changed.
+# Runs as root: at install, and weekly from @UPDATE_LABEL@.
+#
+# Source: the current stable Chrome for Testing from Google. If that cannot be fetched,
+# a copy of /Applications/Google Chrome.app, accepted only with a valid Google signature
+# (that app is writable by your account, so the copy, not the original, is what runs).
+set -euo pipefail
+
+PREFIX=@PREFIX@
+DIR="$PREFIX/chrome"
+LABEL=@LABEL@
+GOOGLE_TEAM=EQHXZ8M8AV
+LKG=https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json
+PLATFORM=mac-arm64; [[ "$(uname -m)" == x86_64 ]] && PLATFORM=mac-x64
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] update-chrome: $*"; }
+
+# Accept an app only if it is signed by Google and the signature is intact, or (Chrome for
+# Testing builds, fetched over HTTPS from Google) carries no signature at all.
+check_app() {
+  local app="$1" info
+  if info="$(codesign -dv --verbose=2 "$app" 2>&1)" && ! grep -q "not signed at all" <<<"$info"; then
+    codesign --verify --deep --strict "$app" || { log "signature check failed for $app"; return 1; }
+    grep -q "TeamIdentifier=$GOOGLE_TEAM" <<<"$info" || { log "$app is not signed by Google"; return 1; }
+  fi
+}
+
+activate() {  # activate VERSION_DIR BINARY_RELATIVE_PATH
+  ln -sfn "$1/$2" "$DIR/current"
+  chown -h root:wheel "$DIR/current"
+  # keep the active version and one previous, drop the rest
+  ls -1t "$DIR" | grep -v -e '^current$' -e '\.tmp$' | tail -n +3 | while read -r old; do rm -rf "${DIR:?}/$old"; done
+  if launchctl print "system/$LABEL" >/dev/null 2>&1; then
+    log "restarting broker on the new browser"
+    launchctl kickstart -k "system/$LABEL" || true
+  fi
+}
+
+install -d -o root -g wheel -m 755 "$DIR"
+current="$(readlink "$DIR/current" 2>/dev/null || true)"
+
+if json="$(curl -fsSL --max-time 60 "$LKG")" && \
+   read -r version url < <(printf '%s' "$json" | "$PREFIX/venv/bin/python" -I -c '
+import json, sys
+s = json.load(sys.stdin)["channels"]["Stable"]
+print(s["version"], next(d["url"] for d in s["downloads"]["chrome"] if d["platform"] == sys.argv[1]))' "$PLATFORM"); then
+  target="$DIR/cft-$version"
+  bin="chrome-$PLATFORM/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
+  if [[ "$current" == "$target/$bin" && -x "$current" ]]; then
+    log "Chrome for Testing $version is current"
+    exit 0
+  fi
+  log "installing Chrome for Testing $version"
+  tmp="$target.tmp"; rm -rf "$tmp"; mkdir -p "$tmp"
+  if curl -fsSL --max-time 900 "$url" -o "$tmp/chrome.zip" && ditto -x -k "$tmp/chrome.zip" "$tmp" && rm "$tmp/chrome.zip" \
+     && check_app "$tmp/chrome-$PLATFORM/Google Chrome for Testing.app"; then
+    xattr -rc "$tmp" 2>/dev/null || true
+    chown -R root:wheel "$tmp"
+    rm -rf "$target"; mv "$tmp" "$target"
+    activate "$target" "$bin"
+    "$DIR/current" --version
+    exit 0
+  fi
+  rm -rf "$tmp"
+  log "Chrome for Testing download failed"
+fi
+
+if [[ -n "$current" && -x "$current" ]]; then
+  log "keeping the installed browser: $current"
+  exit 0
+fi
+
+src="/Applications/Google Chrome.app"
+[[ -d "$src" ]] || { log "no browser available: install Google Chrome or check the network, then rerun"; exit 1; }
+version="$(defaults read "$src/Contents/Info" CFBundleShortVersionString)"
+target="$DIR/chrome-$version"
+log "falling back to a verified copy of Google Chrome $version"
+rm -rf "$target.tmp"; mkdir -p "$target.tmp"
+ditto "$src" "$target.tmp/Google Chrome.app"
+check_app "$target.tmp/Google Chrome.app" || { rm -rf "$target.tmp"; exit 1; }
+chown -R root:wheel "$target.tmp"
+rm -rf "$target"; mv "$target.tmp" "$target"
+activate "$target" "Google Chrome.app/Contents/MacOS/Google Chrome"

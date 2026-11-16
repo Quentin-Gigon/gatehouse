@@ -74,6 +74,16 @@ class Store:
                         (agent_id, name, sign_key, _hash(cdp_token), time.time()))
         return {"agent_id": agent_id, "sign_key": sign_key, "cdp_token": cdp_token}
 
+    def rotate_agent(self, agent_id: str) -> dict:
+        """Issue new keys for an active agent; its grants stay. The old keys stop working at once."""
+        sign_key = secrets.token_urlsafe(32)
+        cdp_token = secrets.token_urlsafe(32)
+        cur = self.db.execute("UPDATE agents SET sign_key=?, cdp_token_hash=? WHERE id=? AND revoked_at IS NULL",
+                              (sign_key, _hash(cdp_token), agent_id))
+        if cur.rowcount != 1:
+            raise KeyError(agent_id)
+        return {"agent_id": agent_id, "sign_key": sign_key, "cdp_token": cdp_token}
+
     def agent(self, agent_id: str):
         return self.db.execute("SELECT * FROM agents WHERE id=?", (agent_id,)).fetchone()
 

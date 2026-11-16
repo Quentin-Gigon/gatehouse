@@ -84,7 +84,9 @@ class Ctx:
         return matches[0]
 
     def agent_id(self, ref: str) -> str:
-        matches = [a for a in self.store.agents() if a["id"] == ref or a["name"] == ref]
+        agents = self.store.agents()
+        matches = [a for a in agents if a["id"] == ref or (a["name"] == ref and not a["revoked_at"])] or \
+                  [a for a in agents if a["name"] == ref]
         if len(matches) != 1:
             die(f"no single agent matches {ref!r}")
         return matches[0]["id"]
@@ -276,7 +278,7 @@ def cmd_import(c: Ctx) -> None:
         print(f"  - {line}")
     print("Imported accounts have no approved website and no grants. Approve one with:\n"
           "  gatehouse account edit <id> --approve-origin https://... --login-url https://...")
-    if confirm(f"Delete the export file {path} now?"):
+    if not c.args.keep_file and confirm(f"Delete the export file {path} now?"):
         path.unlink()
         print("Deleted. On SSDs and synced folders this is not a secure erase; older copies may persist.")
 
@@ -284,7 +286,19 @@ def cmd_import(c: Ctx) -> None:
 # --- agents ------------------------------------------------------------------------
 def cmd_agent_add(c: Ctx) -> None:
     s = c.store
-    a = s.add_agent(c.args.name)
+    if any(a["name"] == c.args.name and not a["revoked_at"] for a in s.agents()):
+        die(f"an active agent named {c.args.name!r} exists; use `agent rotate` for new keys or `agent revoke` first")
+    _issue_agent_keys(c, s.add_agent(c.args.name))
+
+
+def cmd_agent_rotate(c: Ctx) -> None:
+    a = c.store.rotate_agent(c.agent_id(c.args.agent))
+    c.store.audit("agent_keys_rotated", a["agent_id"])
+    _issue_agent_keys(c, a)
+
+
+def _issue_agent_keys(c: Ctx, a: dict) -> None:
+    s = c.store
     port = s.get_setting("port", str(DEFAULT_PORT))
     cfg = {"url": f"http://127.0.0.1:{port}", "agent_id": a["agent_id"], "sign_key": a["sign_key"]}
     endpoint = f"http://127.0.0.1:{port}/cdp/{a['cdp_token']}"
@@ -296,7 +310,7 @@ def cmd_agent_add(c: Ctx) -> None:
     fd = os.open(out, os.O_CREAT | os.O_WRONLY | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w") as f:
         json.dump(cfg, f)
-    print(f"Agent {a['agent_id']} created.")
+    print(f"Agent {a['agent_id']} keys issued.")
     print(f"  API config for the MCP adapter written to {out} (owner-only).")
     print(f"  Browser endpoint for the agent's browser tool (shown once):\n    {endpoint}")
     print("Whoever holds these can act as this agent. They grant nothing until you add a grant.")
@@ -471,11 +485,15 @@ def build_parser() -> argparse.ArgumentParser:
     add(acc, "remove", cmd_account_remove, "delete an account and revoke its grants").add_argument("account")
     add(acc, "unblock", cmd_account_unblock, "reset the failed-login counter").add_argument("account")
 
-    add(sub, "import", cmd_import, "selectively import from a CSV export").add_argument("file")
+    sp = add(sub, "import", cmd_import, "selectively import from a CSV export")
+    sp.add_argument("file")
+    sp.add_argument("--keep-file", action="store_true", help="do not offer to delete the file afterwards")
 
     ag = sub.add_parser("agent", help="manage agents").add_subparsers(dest="sub", required=True)
     sp = add(ag, "add", cmd_agent_add, "register an agent and issue its keys")
     sp.add_argument("name"); sp.add_argument("--write-config", required=True, help="where to write the agent's API config; '-' prints it, with the browser endpoint, as JSON")
+    sp = add(ag, "rotate", cmd_agent_rotate, "issue new keys for an agent, keeping its grants")
+    sp.add_argument("agent"); sp.add_argument("--write-config", required=True, help="as for agent add")
     add(ag, "list", cmd_agent_list, "list agents")
     add(ag, "revoke", cmd_agent_revoke, "revoke an agent entirely").add_argument("agent")
 

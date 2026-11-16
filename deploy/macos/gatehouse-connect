@@ -1,0 +1,96 @@
+#!/bin/bash
+# Give an agent harness its own Gatehouse identity and tools. Run as yourself, not with sudo.
+#
+#   gatehouse-connect claude-code          Claude Code (CLI, desktop, and T3 Code sessions that use it)
+#   gatehouse-connect codex                Codex (CLI, app, and T3 Code sessions that use it)
+#   gatehouse-connect NAME claude|codex|none
+#
+# Registers agent NAME with the broker (asks for your Mac password once), stores its keys in
+# ~/.config/gatehouse/agent-NAME.json (owner-only), installs a pinned Playwright MCP browser
+# tool, and adds two MCP servers to the harness at user scope:
+#   gatehouse          sign-in tools (list accounts, request login, status, logout)
+#   gatehouse-browser  the browser that holds the signed-in sessions
+# Rerunning is safe: an existing identity is reused and the MCP entries are rewritten.
+# The agent can sign in to nothing until you grant it an account with gatehouse-admin.
+set -euo pipefail
+
+PREFIX=@PREFIX@
+PLAYWRIGHT_MCP=@playwright/mcp@0.0.84
+
+NAME="${1:-}"
+if [[ -z "$NAME" || "$NAME" == -h || "$NAME" == --help ]]; then
+  sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0
+fi
+[[ "$NAME" =~ ^[A-Za-z0-9._-]{1,40}$ ]] || { echo "agent name: letters, digits, . _ - (max 40)" >&2; exit 2; }
+[[ $EUID -ne 0 ]] || { echo "run gatehouse-connect as yourself, not with sudo" >&2; exit 2; }
+HARNESS="${2:-}"
+if [[ -z "$HARNESS" ]]; then
+  case "$NAME" in claude*) HARNESS=claude ;; codex*) HARNESS=codex ;; *) HARNESS=none ;; esac
+fi
+
+CFG_DIR="$HOME/.config/gatehouse"
+CFG="$CFG_DIR/agent-$NAME.json"
+install -d -m 700 "$CFG_DIR"
+
+if [[ -s "$CFG" ]]; then
+  echo "Reusing agent identity in $CFG"
+else
+  echo "Registering agent '$NAME' with the broker (sudo may ask for your Mac password)..."
+  json="$(gatehouse-admin agent-json "$NAME")"
+  ( umask 077; printf '%s\n' "$json" > "$CFG" )
+fi
+field() { "$PREFIX/venv/bin/python" -I -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$CFG" "$1"; }
+ENDPOINT="$(field cdp_endpoint)"
+AGENT_ID="$(field agent_id)"
+
+# The browser tool, pinned and installed where the harness can always find it, whatever PATH it starts with.
+NODE="$(command -v node || true)"
+[[ -x "$NODE" ]] || { echo "Node.js is required for the browser tool (brew install node)" >&2; exit 1; }
+NPM="$(dirname "$NODE")/npm"; [[ -x "$NPM" ]] || NPM="$(command -v npm)"
+TOOLS="$CFG_DIR/browser-mcp"
+if [[ ! -f "$TOOLS/node_modules/@playwright/mcp/package.json" ]] || \
+   ! grep -q "\"version\": \"${PLAYWRIGHT_MCP##*@}\"" "$TOOLS/node_modules/@playwright/mcp/package.json"; then
+  echo "Installing $PLAYWRIGHT_MCP..."
+  install -d -m 700 "$TOOLS"
+  "$NPM" install --silent --no-audit --no-fund --prefix "$TOOLS" "$PLAYWRIGHT_MCP" >/dev/null
+fi
+CLI_JS="$TOOLS/node_modules/@playwright/mcp/cli.js"
+
+MCP_CMD="$PREFIX/venv/bin/gatehouse-mcp"
+SIGNIN_JSON="{\"type\":\"stdio\",\"command\":\"$MCP_CMD\",\"env\":{\"GATEHOUSE_AGENT_CONFIG\":\"$CFG\"}}"
+BROWSER_JSON="{\"type\":\"stdio\",\"command\":\"$NODE\",\"args\":[\"$CLI_JS\",\"--cdp-endpoint\",\"$ENDPOINT\"]}"
+
+wire_claude() {
+  local claude; claude="$(command -v claude || true)"
+  [[ -x "$claude" ]] || { echo "claude CLI not found; skipped Claude Code" >&2; return; }
+  "$claude" mcp remove gatehouse -s user >/dev/null 2>&1 || true
+  "$claude" mcp remove gatehouse-browser -s user >/dev/null 2>&1 || true
+  "$claude" mcp add-json gatehouse "$SIGNIN_JSON" -s user >/dev/null
+  "$claude" mcp add-json gatehouse-browser "$BROWSER_JSON" -s user >/dev/null
+  echo "Claude Code: added MCP servers gatehouse and gatehouse-browser (user scope)"
+}
+
+wire_codex() {
+  local codex; codex="$(command -v codex || true)"
+  [[ -x "$codex" ]] || { echo "codex CLI not found; skipped Codex" >&2; return; }
+  "$codex" mcp remove gatehouse >/dev/null 2>&1 || true
+  "$codex" mcp remove gatehouse-browser >/dev/null 2>&1 || true
+  "$codex" mcp add gatehouse --env "GATEHOUSE_AGENT_CONFIG=$CFG" -- "$MCP_CMD" >/dev/null
+  "$codex" mcp add gatehouse-browser -- "$NODE" "$CLI_JS" --cdp-endpoint "$ENDPOINT" >/dev/null
+  echo "Codex: added MCP servers gatehouse and gatehouse-browser"
+}
+
+case "$HARNESS" in
+  claude) wire_claude ;;
+  codex) wire_codex ;;
+  none) echo "Not wiring any harness. MCP server definitions:"; echo "  gatehouse:         $SIGNIN_JSON"; echo "  gatehouse-browser: $BROWSER_JSON" ;;
+  *) echo "unknown harness '$HARNESS' (claude, codex or none)" >&2; exit 2 ;;
+esac
+
+cat <<EOF
+
+Agent '$NAME' ($AGENT_ID) is connected. It can sign in to nothing yet. Grant it an account:
+  gatehouse-admin account list
+  gatehouse-admin grant add --agent $NAME --account "<account name>" --for forever
+[[ "$HARNESS" == none ]] || echo "Restart open $HARNESS sessions so they pick up the new tools."
+EOF

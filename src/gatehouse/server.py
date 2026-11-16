@@ -25,6 +25,7 @@ CLOCK_SKEW = 60.0
 MAX_BODY = 64 * 1024
 MAX_FAILURES = 2
 REQUEST_TTL = 3600.0
+REVOKE_POLL = 2.0
 
 
 def sign(sign_key: str, method: str, path: str, ts: str, nonce: str, body: bytes) -> str:
@@ -210,17 +211,31 @@ class Broker:
         req.task = asyncio.create_task(self._run_login(req, cred, allowed, d.grant_id))
         return req.public()
 
+    def _recheck(self, req: LoginRequest, grant_id: str):
+        """Re-validate a queued login once it holds the browser: it may have waited minutes behind
+        another login, during which the grant, the account or the switches may have changed."""
+        cred = self.vault.get(self.key, req.credential_id) if self.key else None
+        agent = self.store.agent(req.agent_id)
+        g = next((x for x in self.store.grants(agent_id=req.agent_id, credential_id=req.credential_id)
+                  if x["id"] == grant_id), None)
+        now = time.time()
+        if (cred is None or g is None or g["revoked_at"] is not None or agent is None or agent["revoked_at"] is not None
+                or self.store.logins_disabled() or req.origin not in cred.origins
+                or req.origin not in json.loads(g["origins"])
+                or (g["kind"] == "until" and (g["expires_at"] is None or g["expires_at"] <= now))
+                or (g["kind"] == "session" and g["boot_id"] != self.boot_id)):
+            return None, []
+        return cred, [o for o in json.loads(g["origins"]) if o in cred.origins]
+
     async def _run_login(self, req: LoginRequest, cred, allowed: list[str], grant_id: str) -> None:
         status, detail, run, browser = L.FAILED, "browser_error", None, None
         try:
             browser = await self.browser_for(req.agent_id)
             async with browser.lock:
-                g = [x for x in self.store.grants(agent_id=req.agent_id, credential_id=cred.id) if x["id"] == grant_id]
-                agent = self.store.agent(req.agent_id)
-                if not g or g[0]["revoked_at"] is not None or agent["revoked_at"] is not None or self.store.logins_disabled():
+                cred, allowed = self._recheck(req, grant_id)
+                if cred is None:
                     status, detail = L.PERMISSION_DENIED, "revoked_before_use"
                     return
-                await browser.close_gate()
 
                 def on_status(s: str, d: str) -> None:
                     req.status, req.detail = s, d
@@ -232,28 +247,53 @@ class Broker:
                 run = L.LoginRun(browser, cred, allowed, self.timeouts, on_status=on_status)
                 req.detail = "signing_in"
                 try:
+                    await browser.close_gate()
                     await run.open_tab()
                     status, detail = await run.run()
                 finally:
-                    await asyncio.shield(run.finish(keep_tab=status in (L.SIGNED_IN, L.ALREADY)))
-                    browser.open_gate()
+                    # Cleanup runs to completion even if this task is cancelled (again) meanwhile;
+                    # the gate reopens only on a browser that no longer holds the login tab.
+                    await _uncancellable(self._hand_back(req.agent_id, browser, run, status in (L.SIGNED_IN, L.ALREADY)))
         except asyncio.CancelledError:
             status, detail = L.CANCELLED, "cancelled_by_agent"
         except CDPError:
             status, detail = L.FAILED, "browser_error"
         finally:
             self._close_handoffs(req.id)
-            if browser is not None:
-                browser.open_gate()
             if status == L.FAILED and detail in ("credentials_rejected", "code_rejected"):
-                self.store.record_failure(cred.id)
+                self.store.record_failure(cred.id if cred else req.credential_id)
             elif status in (L.SIGNED_IN, L.ALREADY):
-                self.store.clear_failures(cred.id)
+                self.store.clear_failures(req.credential_id)
                 self.store.count_use(grant_id)
             if status == L.PERMISSION_REQUIRED and run is not None and run.unapproved_origin:
-                self.store.request_approval(req.agent_id, cred.id, run.unapproved_origin)
+                self.store.request_approval(req.agent_id, req.credential_id, run.unapproved_origin)
             req.status, req.detail = status, detail
-            self.store.audit("login_result", req.agent_id, cred.id, req.origin, "allowed", f"{status}:{detail}")
+            self.store.audit("login_result", req.agent_id, req.credential_id, req.origin, "allowed", f"{status}:{detail}")
+
+    async def _hand_back(self, agent_id: str, browser: Browser, run: L.LoginRun, signed_in: bool) -> None:
+        self._close_handoffs_for_run(run)
+        try:
+            safe = await run.finish(signed_in)
+        except Exception:
+            safe = False
+        if safe:
+            browser.open_gate()
+            return
+        # The login tab may still exist: never give this browser back. Kill it; the next request
+        # starts a fresh one on the same profile (cookies persist, nothing in memory does).
+        self.store.audit("browser_discarded", agent_id, result="login_tab_not_destroyed")
+        try:
+            await browser.stop()
+        finally:
+            if self.browsers.get(agent_id) is browser:
+                del self.browsers[agent_id]
+                self.session_ids.pop(agent_id, None)
+            browser.open_gate()
+
+    def _close_handoffs_for_run(self, run: L.LoginRun) -> None:
+        for token in [t for t, h in self.handoffs.items() if h.sid == run.sid]:
+            self.handoffs.pop(token).close()
+        self._publish_handoffs()
 
     # --- human handoff ---------------------------------------------------------------
     def _open_handoff(self, req: LoginRequest, browser: Browser, session_id: str) -> None:
@@ -362,8 +402,35 @@ class Broker:
             return web.json_response({"error": "protected login in progress; retry shortly"}, status=423)
         ws = web.WebSocketResponse(max_msg_size=256 * 1024 * 1024)
         await ws.prepare(request)
-        await b.serve_agent(ws)
+        watch = asyncio.create_task(self._close_when_revoked(agent["id"], ws))
+        try:
+            await b.serve_agent(ws)
+        finally:
+            watch.cancel()
         return ws
+
+    async def _close_when_revoked(self, agent_id: str, ws) -> None:
+        """Revocation must also end a browser connection the agent already holds, not just new ones."""
+        while not ws.closed:
+            await asyncio.sleep(REVOKE_POLL)
+            row = self.store.agent(agent_id)
+            if row is None or row["revoked_at"] is not None:
+                await ws.close(code=1008, message=b"agent revoked")
+                return
+
+
+async def _uncancellable(coro) -> None:
+    """Await `coro` to completion even if the caller is cancelled, possibly repeatedly; then re-raise."""
+    task = asyncio.ensure_future(coro)
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+    if cancelled:
+        raise asyncio.CancelledError
+    task.result()
 
 
 async def serve(broker: Broker) -> web.AppRunner:
