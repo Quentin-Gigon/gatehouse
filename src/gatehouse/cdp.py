@@ -52,7 +52,7 @@ def find_chrome(explicit: str | None = None) -> str:
 ROOT_ALLOW = {
     "Browser.getVersion", "Browser.getWindowForTarget", "Browser.getWindowBounds", "Browser.setWindowBounds",
     "Browser.grantPermissions", "Browser.resetPermissions",
-    "Storage.getCookies", "Storage.setCookies", "Storage.clearCookies",
+    "Storage.setCookies", "Storage.clearCookies",
     "Target.getTargets", "Target.getTargetInfo", "Target.attachToTarget", "Target.detachFromTarget",
     "Target.createTarget", "Target.closeTarget", "Target.activateTarget", "Target.setAutoAttach",
     "Target.setDiscoverTargets", "Target.getBrowserContexts", "Target.createBrowserContext",
@@ -69,9 +69,15 @@ DENY = {
     "Input.dispatchDragEvent", "Input.setInterceptDrags",
     "Security.setIgnoreCertificateErrors", "Security.setOverrideCertificateErrors",
     "Network.setCertificateOverride", "Page.setBypassCSP",
+    # Session cookies stay in the broker's browser: an agent uses a signed-in site, it can't take the login away.
+    "Storage.getCookies", "Network.getCookies", "Network.getAllCookies", "Page.getCookies",
 }
 DENY_PREFIX = ("Tracing.", "Extensions.", "SystemInfo.", "Tethering.", "Cast.", "Memory.", "HeapProfiler.")
 URL_METHODS = {"Page.navigate", "Target.createTarget", "Network.loadNetworkResource"}
+# Events and results from these domains carry request/response headers; cookie data is stripped
+# from them before an agent sees them (see scrub_cookies).
+SCRUB_PREFIX = ("Network.", "Fetch.", "Audits.", "Storage.")
+COOKIE_HEADERS = {"cookie", "cookie2", "set-cookie", "set-cookie2"}
 # Every agent session must be flat, so each command arrives as a top-level message this filter sees.
 FORCE_FLATTEN = {"Target.attachToTarget", "Target.setAutoAttach"}
 
@@ -96,6 +102,30 @@ def check_agent_command(msg: dict, rootlike: bool) -> str | None:
         if url not in ("", "about:blank") and urlsplit(url).scheme.lower() not in ("http", "https"):
             return "only http(s) addresses are permitted"
     return None
+
+
+def scrub_cookies(o):
+    """Copy of a CDP payload without cookie headers, raw header text or cookie details."""
+    if isinstance(o, dict):
+        out = {}
+        for k, v in o.items():
+            kl = k.lower()
+            if kl in COOKIE_HEADERS or kl in ("headerstext", "requestheaderstext"):
+                continue
+            if "cookie" in kl:
+                if isinstance(v, list):
+                    out[k] = []           # required arrays (associatedCookies, blockedCookies) stay present
+                continue
+            out[k] = scrub_cookies(v)
+        return out
+    if isinstance(o, list):              # also header lists of {name, value}, as Fetch uses
+        return [scrub_cookies(x) for x in o
+                if not (isinstance(x, dict) and str(x.get("name", "")).lower() in COOKIE_HEADERS)]
+    return o
+
+
+def _for_agent(msg: dict, method: str | None) -> dict:
+    return scrub_cookies(msg) if method and method.startswith(SCRUB_PREFIX) else msg
 
 
 class _Agent:
@@ -251,7 +281,7 @@ class Browser:
                     extra.set_result(msg)
             elif owner in self._agents:
                 msg["id"] = orig_id
-                owner.out.put_nowait(msg)
+                owner.out.put_nowait(_for_agent(msg, extra))
             return
         method, sid, params = msg.get("method"), msg.get("sessionId"), msg.get("params") or {}
         if method == "Target.attachedToTarget":
@@ -268,10 +298,10 @@ class Browser:
                 cb(msg)
         elif owner is not None:
             if owner in self._agents:
-                owner.out.put_nowait(msg)
+                owner.out.put_nowait(_for_agent(msg, method))
         else:
             for a in self._agents:
-                a.out.put_nowait(msg)
+                a.out.put_nowait(_for_agent(msg, method))
             for cb in self._listeners:
                 cb(msg)
 

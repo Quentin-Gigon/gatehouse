@@ -123,3 +123,40 @@ async def test_page_that_hangs_does_not_hold_the_gate(env):
     assert asyncio.get_event_loop().time() - start < 45
     _, b = await env.api("/v1/browser")
     assert b["gate_open"]
+
+
+async def test_agent_cannot_read_session_cookies(env):
+    """Signed in, the agent can use the site but can't copy the HttpOnly session cookie out."""
+    cid = env.add_account()
+    env.grant(cid)
+    assert (await env.login(cid))["status"] == L.SIGNED_IN
+    ws = await env.http.ws_connect(env.relay_url(), max_msg_size=0)
+    agent = AgentCDP(ws)
+    for method in ("Storage.getCookies", "Network.getAllCookies"):
+        assert "not permitted" in agent_error(await agent.call(method, {}))
+    sid = await agent.page()
+    for method in ("Network.getCookies", "Network.getAllCookies", "Storage.getCookies"):
+        assert "not permitted" in agent_error(await agent.call(method, {}, sid))
+    await agent.call("Network.enable", {}, sid)
+    await agent.call("Fetch.enable", {"patterns": [{"urlPattern": "*", "requestStage": "Response"}]}, sid)
+    await agent.call("Page.reload", {}, sid)
+    end = asyncio.get_event_loop().time() + 3
+    while asyncio.get_event_loop().time() < end:              # let paused responses through, keep events
+        try:
+            f = await ws.receive(timeout=0.5)
+        except asyncio.TimeoutError:
+            continue
+        e = json.loads(f.data)
+        agent.events.append(e)
+        if e.get("method") == "Fetch.requestPaused":
+            await ws.send_json({"id": 9000 + len(agent.events), "sessionId": sid, "method": "Fetch.continueRequest",
+                                "params": {"requestId": e["params"]["requestId"]}})
+    assert "Signed in as reader" in await agent.evaluate(sid, "document.body.innerText")
+    assert any(e.get("method") == "Network.requestWillBeSentExtraInfo" for e in agent.events)
+    blob = json.dumps(agent.events).lower()
+    assert "session=ok" not in blob and '"set-cookie"' not in blob and '"cookie"' not in blob
+    await ws.close()
+
+
+def agent_error(reply: dict) -> str:
+    return (reply.get("error") or {}).get("message", "")
