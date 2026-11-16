@@ -137,10 +137,31 @@ final class AppModel: ObservableObject {
 
     // MARK: install
 
+    /// Where root writes the bundled scripts' output: a folder only root can change, so nothing
+    /// running as you can point the log at another file.
+    static let runLog = URL(fileURLWithPath: "/var/log/gatehouse/run.log")
+
+    /// Run one of the bundled service scripts as root. Root first copies the whole app into a fresh
+    /// root-only folder and verifies the copy's signature, so a script edited inside the app (which
+    /// your account can write to) is refused instead of run.
+    private func runBundled(_ script: String, _ args: [String], prompt: String) async throws {
+        let argv = args.map(Shell.quote).joined(separator: " ")
+        let cmd = [
+            "L=/var/log/gatehouse",
+            "[ ! -L \"$L\" ] || exit 90",
+            "mkdir -p \"$L\" && chown root:wheel \"$L\" && chmod 755 \"$L\" && rm -f \"$L/run.log\" || exit 91",
+            "D=\"$(mktemp -d /tmp/gatehouse-app.XXXXXX)\" || exit 92",
+            "trap 'rm -rf \"$D\"' EXIT",
+            "{ ditto \(Shell.quote(Bundle.main.bundlePath)) \"$D/Gatehouse.app\" && codesign --verify --deep --strict \"$D/Gatehouse.app\"; } > \"$L/run.log\" 2>&1"
+                + " || { echo 'This copy of Gatehouse was changed after it was built, so it was not run. Download it again.' >> \"$L/run.log\"; exit 93; }",
+            "/bin/bash \"$D/Gatehouse.app/Contents/Resources/payload/deploy/macos/\(script)\" \(argv) >> \"$L/run.log\" 2>&1",
+        ].joined(separator: "; ")
+        _ = try await Shell.admin(cmd, prompt: prompt)
+    }
+
     func install() async {
-        guard let payload = Paths.payload else { error = "This copy of the app is incomplete."; return }
-        let log = FileManager.default.temporaryDirectory.appendingPathComponent("gatehouse-install.log")
-        FileManager.default.createFile(atPath: log.path, contents: nil)
+        guard Paths.payload != nil else { error = "This copy of the app is incomplete."; return }
+        let log = Self.runLog
         installLog = ""
         busy = "Installing…"
         let tail = Task { @MainActor in
@@ -150,10 +171,10 @@ final class AppModel: ObservableObject {
             }
         }
         defer { tail.cancel(); busy = nil }
-        let script = payload.appendingPathComponent("deploy/macos/install.sh").path
-        let cmd = "/bin/bash \(Shell.quote(script)) --yes --user \(Shell.quote(NSUserName())) > \(Shell.quote(log.path)) 2>&1"
         do {
-            _ = try await Shell.admin(cmd, prompt: "Gatehouse needs your password to install its background service.")
+            // --yes: this window is the confirmation the terminal installer would otherwise ask for.
+            try await runBundled("install.sh", ["--yes", "--user", NSUserName()],
+                                 prompt: "Gatehouse needs your password to install its background service.")
             installLog = (try? String(contentsOf: log, encoding: .utf8)) ?? installLog
             await poll()
         } catch {
@@ -165,13 +186,12 @@ final class AppModel: ObservableObject {
     }
 
     func uninstall(purge: Bool) async {
-        guard let payload = Paths.payload else { return }
+        guard Paths.payload != nil else { return }
         busy = "Removing…"
         defer { busy = nil }
-        let script = payload.appendingPathComponent("deploy/macos/uninstall.sh").path
         do {
-            _ = try await Shell.admin("/bin/bash \(Shell.quote(script))\(purge ? " --purge" : "")",
-                                      prompt: "Gatehouse needs your password to remove its background service.")
+            try await runBundled("uninstall.sh", purge ? ["--purge"] : [],
+                                 prompt: "Gatehouse needs your password to remove its background service.")
             for h in Harness.all { try? FileManager.default.removeItem(at: Paths.agentConfig(h.agentName)) }
             api.token = nil
             unlocked = false
