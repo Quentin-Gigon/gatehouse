@@ -39,9 +39,15 @@ check_cft() {
   check_app_strict "$app"
 }
 
+# $DIR/current is a launcher script, not a symlink: Chrome locates its framework from the path it
+# was started by, so a symlink outside the .app makes it abort. exec keeps the same process.
+current_target() { sed -n "s/^exec '\(.*\)' \"\$@\"\$/\1/p" "$DIR/current" 2>/dev/null || true; }
+
 activate() {  # activate VERSION_DIR BINARY_RELATIVE_PATH
-  ln -sfn "$1/$2" "$DIR/current"
-  chown -h root:wheel "$DIR/current"
+  local launcher="$DIR/.current.$$"
+  printf "#!/bin/sh\nexec '%s' \"\$@\"\n" "$1/$2" > "$launcher"
+  chown root:wheel "$launcher"; chmod 755 "$launcher"
+  mv -f "$launcher" "$DIR/current"   # replaces an old symlink itself, never writes through it
   # keep the active version and one previous, drop the rest
   ls -1t "$DIR" | grep -v -e '^current$' -e '\.tmp$' | tail -n +3 | while read -r old; do rm -rf "${DIR:?}/$old"; done
   if launchctl print "system/$LABEL" >/dev/null 2>&1; then
@@ -51,7 +57,7 @@ activate() {  # activate VERSION_DIR BINARY_RELATIVE_PATH
 }
 
 install -d -o root -g wheel -m 755 "$DIR"
-current="$(readlink "$DIR/current" 2>/dev/null || true)"
+current="$(current_target)"
 
 if json="$(curl -fsSL --max-time 60 "$LKG")" && \
    read -r version url < <(printf '%s' "$json" | "$PREFIX/venv/bin/python" -I -c '
