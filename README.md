@@ -8,7 +8,7 @@ Gatehouse is a free, open-source Mac app for people who use AI agents such as Cl
 
 It also works when you're away: a scheduled task can sign in at 3am without asking you. You're only needed if a website shows a CAPTCHA or texts you a code.
 
-> **Status: 0.3.0, early.** Works on macOS 14 or later. Tested with Claude Code, Codex and Claude Desktop. Some websites need a small tweak to sign in; see [Troubleshooting](#when-a-website-doesnt-sign-in).
+> **Status: 0.3.0, early.** Works on Apple Silicon Macs (M1 or newer) with macOS 14 or later. Tested with Claude Code, Codex and Claude Desktop. Some websites need a small tweak to sign in; see [Troubleshooting](#when-a-website-doesnt-sign-in).
 
 ## Install
 
