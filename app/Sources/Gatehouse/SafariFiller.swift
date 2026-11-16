@@ -108,7 +108,10 @@ final class SafariFiller {
     }
 
     private var cancelled = Set<String>()
-    private var useHID = false        // fall back to system-wide key events if Safari ignores targeted ones
+    // Per sign-in: Safari ignored keys sent to it directly, so non-secret text goes as system-wide key
+    // events, only while Safari is frontmost. The password never does (see typePassword).
+    private var useHID = false
+    private var pid: pid_t = 0
 
     func cancel(_ id: String) { cancelled.insert(id) }
 
@@ -123,11 +126,13 @@ final class SafariFiller {
 
     func run(_ job: Job, progress: (String) -> Void) async -> (String, String) {
         defer { cancelled.remove(job.requestId) }
+        useHID = false
         do {
             guard Self.hasPermission else { throw Stop(status: "login_failed", detail: "gatehouse_app_needs_accessibility_permission_ask_the_user") }
             guard let url = URL(string: job.loginURL) else { throw Stop(status: "unsupported_login_flow", detail: "bad_sign_in_address") }
             progress("opening_safari")
             let safari = try await openInSafari(url)
+            pid = safari.processIdentifier
             let app = AXUIElementCreateApplication(safari.processIdentifier)
 
             progress("waiting_for_sign_in_page")
@@ -143,7 +148,7 @@ final class SafariFiller {
             }
             guard let pw = fields.password else { throw Stop(status: "unsupported_login_flow", detail: "no_password_field_found") }
             progress("typing_password")
-            try await type(job.password, into: pw, app: app, pid: safari.processIdentifier, job: job, secure: true)
+            try await typePassword(job.password, into: pw, app: app, job: job)
             try pressReturn(on: pw, app: app, pid: safari.processIdentifier, job: job)
 
             progress("waiting_for_website")
@@ -216,31 +221,65 @@ final class SafariFiller {
         if secure && AX.string(field, kAXSubroleAttribute) != "AXSecureTextField" {
             throw Stop(status: "unsupported_login_flow", detail: "password_field_changed")
         }
+        try requireSafariInFront()
         if !AX.isFocused(field, in: app) {
             AXUIElementSetAttributeValue(field, kAXFocusedAttribute as CFString, kCFBooleanTrue)
             if !AX.isFocused(field, in: app) { throw Stop(status: "login_failed", detail: "focus_moved_stopped_typing") }
         }
     }
 
+    /// System-wide key events go to whichever app is in front, so they are only allowed while that is Safari.
+    private func requireSafariInFront() throws {
+        if useHID && NSWorkspace.shared.frontmostApplication?.processIdentifier != pid {
+            throw Stop(status: "login_failed", detail: "safari_lost_focus_stopped_typing")
+        }
+    }
+
+    /// Username and authenticator codes.
     private func type(_ text: String, into field: AXUIElement, app: AXUIElement, pid: pid_t, job: Job, secure: Bool) async throws {
-        try verify(field, app: app, job: job, secure: secure)
+        precondition(!secure, "passwords go through typePassword")
+        try verify(field, app: app, job: job, secure: false)
         Keys.selectAllAndDelete(pid: pid, hid: useHID)
         try await Task.sleep(nanoseconds: 80_000_000)
         var first = true
         for ch in text {
-            try verify(field, app: app, job: job, secure: secure)
+            try verify(field, app: app, job: job, secure: false)
             Keys.type(ch, pid: pid, hid: useHID)
+            try requireSafariInFront()
             try await Task.sleep(nanoseconds: 15_000_000)
-            if first && !secure {
+            if first {
                 first = false
-                // Some Safari versions ignore keys sent to it directly; then send them system-wide
-                // (Safari is frontmost and the field focused, both just verified).
+                // Some Safari versions ignore keys sent to it directly; then send this (non-secret) text
+                // system-wide, with Safari frontmost and the field focused, re-checked around every key.
                 try await Task.sleep(nanoseconds: 120_000_000)
                 if (AX.string(field, kAXValueAttribute) ?? "").isEmpty && !useHID {
                     useHID = true
+                    try verify(field, app: app, job: job, secure: false)
                     Keys.type(ch, pid: pid, hid: true)
+                    try requireSafariInFront()
                 }
             }
+        }
+    }
+
+    /// The password only ever goes to Safari itself: as keys sent to Safari's process, or, if Safari
+    /// ignores those, set directly on the verified password field. Never as system-wide key events.
+    private func typePassword(_ password: String, into field: AXUIElement, app: AXUIElement, job: Job) async throws {
+        try verify(field, app: app, job: job, secure: true)
+        if useHID {
+            let err = AXUIElementSetAttributeValue(field, kAXValueAttribute as CFString, password as CFString)
+            let count = AX.value(field, kAXNumberOfCharactersAttribute) as? Int
+            guard err == .success, count == nil || count == password.count else {
+                throw Stop(status: "unsupported_login_flow", detail: "safari_did_not_accept_the_password_field")
+            }
+            return
+        }
+        Keys.selectAllAndDelete(pid: pid, hid: false)
+        try await Task.sleep(nanoseconds: 80_000_000)
+        for ch in password {
+            try verify(field, app: app, job: job, secure: true)
+            Keys.type(ch, pid: pid, hid: false)
+            try await Task.sleep(nanoseconds: 15_000_000)
         }
     }
 
@@ -287,7 +326,8 @@ final class SafariFiller {
 
     private func clear(_ field: AXUIElement, app: AXUIElement, pid: pid_t, job: Job) {
         guard (try? verify(field, app: app, job: job, secure: true)) != nil else { return }
-        Keys.selectAllAndDelete(pid: pid, hid: useHID)
+        AXUIElementSetAttributeValue(field, kAXValueAttribute as CFString, "" as CFString)
+        Keys.selectAllAndDelete(pid: pid, hid: false)
     }
 
     private func check(_ job: Job) throws {
