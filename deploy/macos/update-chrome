@@ -17,17 +17,25 @@ PLATFORM=mac-arm64; [[ "$(uname -m)" == x86_64 ]] && PLATFORM=mac-x64
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] update-chrome: $*"; }
 
 # Signed by Google with an intact signature. Nothing else: no ad-hoc, no other team, no unsigned.
+# (Output is captured before matching: with pipefail, `codesign | grep -q` fails when grep exits early.)
 check_app_strict() {
-  local app="$1"
+  local app="$1" info
   codesign --verify --deep --strict "$app" || { log "signature check failed for $app"; return 1; }
-  codesign -dv --verbose=2 "$app" 2>&1 | grep -qx "TeamIdentifier=$GOOGLE_TEAM" || { log "$app is not signed by Google"; return 1; }
+  info="$(codesign -dv --verbose=2 "$app" 2>&1 || true)"
+  grep -qx "TeamIdentifier=$GOOGLE_TEAM" <<<"$info" || { log "$app is not signed by Google"; return 1; }
 }
 
-# Chrome for Testing, fetched over HTTPS straight from Google: strict if it carries a signature,
-# accepted unsigned (some builds are). Never used for anything that came from a writable folder.
+# Chrome for Testing, fetched over HTTPS straight from Google into a root-only folder. Its builds
+# carry no Google identity (unsigned, or ad-hoc/linker-signed only), which proves nothing either
+# way; provenance is the download. If one does name a team, it must be Google's and verify strictly.
+# Never used for anything that came from a writable folder.
 check_cft() {
-  local app="$1"
-  if codesign -dv "$app" 2>&1 | grep -q "not signed at all"; then return 0; fi
+  local app="$1" info
+  info="$(codesign -dv --verbose=2 "$app" 2>&1 || true)"
+  if grep -q "not signed at all" <<<"$info" || ! grep -q "^TeamIdentifier=" <<<"$info" \
+     || grep -qx "TeamIdentifier=not set" <<<"$info"; then
+    return 0
+  fi
   check_app_strict "$app"
 }
 
