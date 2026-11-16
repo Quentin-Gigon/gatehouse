@@ -1,0 +1,8 @@
+{
+  "name": "gatehouse-browser-mcp",
+  "private": true,
+  "description": "The agents' browser tool, pinned. Installed by deploy/macos/install.sh with npm ci.",
+  "dependencies": {
+    "@playwright/mcp": "0.0.84"
+  }
+}

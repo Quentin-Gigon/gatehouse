@@ -292,3 +292,17 @@ async def test_handoff_link_dies_after_wrong_codes_and_is_replaced(env):
     assert second["token"] != first["token"] and second["request_id"] == r["request_id"]
     assert any(row["action"] == "handoff_claim_refused" for row in env.store.audit_rows(50))
     await env.api("/v1/login/cancel", {"request_id": r["request_id"]})
+
+
+async def test_delayed_federated_post_finishes_before_handback(env):
+    cid = env.add_account("/sso-start", origins=[env.origin, env.other])
+    env.grant(cid, origins=[env.origin, env.other])
+    result = await env.login(cid)
+    assert result["status"] == L.SIGNED_IN, result
+    ws = await env.http.ws_connect(env.relay_url(), max_msg_size=0)
+    agent = AgentCDP(ws)
+    try:
+        sid = await agent.page()
+        assert "Signed in as reader" in await agent.evaluate(sid, "document.body.innerText")
+    finally:
+        await ws.close()

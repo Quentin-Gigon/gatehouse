@@ -2,12 +2,18 @@
 
 Gatehouse runs as a background service under its own hidden macOS user, so the agents, which run as you, cannot read the vault, the broker's memory, or the browser's cookies. You manage it with `gatehouse-admin`, which asks for your Mac password. Agents never have that password, so they cannot grant themselves anything.
 
+## Easiest: the app
+
+Download Gatehouse.zip from the releases page, move Gatehouse to Applications and open it. **Set Up Gatehouse** runs the installer below for you (one Mac password prompt). After that, everything on this page has a button in the app: Websites (add, import, edit, who may sign in), Agents (connect Claude Code, Codex, Claude Desktop), Needs You (CAPTCHAs and access requests, also as notifications), Activity, and Settings (pause all sign-ins, update, remove).
+
+The app is locked by default. Unlocking runs `gatehouse-admin admin-token` through the standard macOS administrator prompt; the token it gets lasts until 15 minutes without use (12 hours at most), lives only in the app's memory, and opens the broker's admin API (`/admin/*`). No admin call returns a password or TOTP secret.
+
+The rest of this page is the same setup from the command line.
+
 ## Requirements
 
-- macOS on Apple Silicon or Intel, with an admin account
-- [`uv`](https://docs.astral.sh/uv/) (`brew install uv`): used once to fetch a private Python 3.12
-- Node.js (`brew install node`): for the agents' browser tool
-- Network access to download Chrome for Testing. If that download fails, a signature-checked copy of `/Applications/Google Chrome.app` is used instead
+- macOS 14 or later, Apple Silicon or Intel, with an admin account
+- Network access during setup. The installer downloads pinned, checksum-verified copies of [`uv`](https://docs.astral.sh/uv/) (to fetch a private Python 3.12), Node.js (for the agents' browser tool), and Chrome for Testing. If the Chrome download fails, a signature-checked copy of `/Applications/Google Chrome.app` is used instead. Nothing needs to be installed beforehand.
 
 ## Install
 

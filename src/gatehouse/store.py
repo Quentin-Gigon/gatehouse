@@ -33,6 +33,8 @@ CREATE TABLE IF NOT EXISTS audit(
   origin TEXT, action TEXT NOT NULL, decision TEXT, result TEXT);
 CREATE TABLE IF NOT EXISTS failures(credential_id TEXT PRIMARY KEY, count INTEGER NOT NULL, last_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS admin_tokens(hash TEXT PRIMARY KEY, created_at REAL NOT NULL, last_used REAL NOT NULL,
+  expires_at REAL NOT NULL);
 """
 
 GRANT_KINDS = ("once", "session", "until", "until_revoked")
@@ -97,6 +99,25 @@ class Store:
     def revoke_agent(self, agent_id: str) -> bool:
         cur = self.db.execute("UPDATE agents SET revoked_at=? WHERE id=? AND revoked_at IS NULL", (time.time(), agent_id))
         return cur.rowcount == 1
+
+    # admin sessions (the app's unlock) -------------------------------------
+    def add_admin_token(self, max_age: float) -> str:
+        """Issue an admin token. Only the hash is kept; the token is shown once."""
+        token, now = secrets.token_urlsafe(32), time.time()
+        self.db.execute("DELETE FROM admin_tokens WHERE expires_at < ?", (now,))
+        self.db.execute("INSERT INTO admin_tokens(hash,created_at,last_used,expires_at) VALUES(?,?,?,?)",
+                        (_hash(token), now, now, now + max_age))
+        return token
+
+    def use_admin_token(self, token: str, idle: float) -> bool:
+        """Valid if unexpired and used within `idle` seconds; each use extends the idle window."""
+        now = time.time()
+        cur = self.db.execute("UPDATE admin_tokens SET last_used=? WHERE hash=? AND expires_at>? AND last_used>?",
+                              (now, _hash(token), now, now - idle))
+        return cur.rowcount == 1
+
+    def revoke_admin_token(self, token: str) -> None:
+        self.db.execute("DELETE FROM admin_tokens WHERE hash=?", (_hash(token),))
 
     # replay protection ----------------------------------------------------
     def use_nonce(self, agent_id: str, nonce: str, ts: float, window: float) -> bool:

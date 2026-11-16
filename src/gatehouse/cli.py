@@ -158,6 +158,12 @@ def cmd_selftest(c: Ctx) -> None:
         s.revoke_agent(a["agent_id"])
 
 
+def cmd_admin_token(c: Ctx) -> None:
+    """For the Gatehouse app: a token for the running broker's admin API. Running this needs the
+    broker user's rights, which is what makes the app ask for your Mac password to unlock."""
+    print(c.store.add_admin_token(c.args.max_age))
+
+
 def cmd_status(c: Ctx) -> None:
     s = c.store
     print(f"home:            {c.paths.home}")
@@ -488,6 +494,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     add(sub, "init", cmd_init, "create the vault")
     add(sub, "status", cmd_status, "show broker state")
+    add(sub, "admin-token", cmd_admin_token, "issue a token for the app's admin API (prints it)").add_argument(
+        "--max-age", type=float, default=12 * 3600, help="seconds before the token expires even if in use")
     add(sub, "selftest", cmd_selftest, "check that the running broker can unlock the vault and start a browser")
     sp = add(sub, "serve", cmd_serve, "run the broker")
     sp.add_argument("--port", type=int, default=DEFAULT_PORT)

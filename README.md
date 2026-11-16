@@ -1,81 +1,70 @@
+<p align="center"><img src="app/Resources/icon.png" width="96" alt=""></p>
+
 # Gatehouse
 
-A local, open-source credential broker for AI agents. You choose which agent may sign in to which account on which website and for how long. The broker types the credentials into a browser it owns; the agent gets the signed-in session, not the password.
+**Let your AI agents sign in to the websites you choose, without ever seeing your passwords.**
 
-> **Status: 0.2.0.** Runs on macOS as a background service under its own hidden user (`deploy/macos`). Tested with Chrome 157 on macOS 27 and with Claude Code driving it through MCP. It is not yet proven against many real websites, so expect to tune a few with per-site settings. Gatehouse is an independent project and is not affiliated with 1Password or any other vendor.
+Gatehouse is a free, open-source Mac app for people who use AI agents such as Claude Code, Codex or Claude Desktop. You give it the logins your agents may use (your school's Moodle, a supplier portal, a library account) and switch on which agent may use which. When an agent needs to sign in, Gatehouse types the password into its own hidden browser and hands the agent the signed-in page. The agent never gets the password, and can only sign in where you've said yes.
 
-## What it does
+It also works when you're away: a scheduled task can sign in at 3am without asking you. You're only needed if a website shows a CAPTCHA or texts you a code.
 
-- Stores only the accounts you add or individually select from a CSV export, in an encrypted vault.
-- Denies by default. A grant names one agent, one account, the approved websites, and a duration: once, this broker session, until a date, or until revoked.
-- Signs in for the agent inside a browser only the broker can control. While it types, the agent's browser connection is closed.
-- Within a grant, repeat logins need no prompt. Outside it, the request waits for you.
-- Hands CAPTCHA, push approval and other challenges to you, then lets the agent continue.
-- Keeps an activity history with identifiers and outcomes, never values.
-- No telemetry, no hosted service, no subscription.
+> **Status: 0.3.0, early.** Works on macOS 14 or later. Tested with Claude Code, Codex and Claude Desktop. Some websites need a small tweak to sign in; see [Troubleshooting](#when-a-website-doesnt-sign-in).
 
-## Quick start (macOS)
+## Install
 
-```sh
-sudo deploy/macos/install.sh                  # service user, private Python + Chrome, vault, LaunchDaemon
-gatehouse-admin account add                   # name, username, hidden password, sign-in page
-gatehouse-connect claude-code                 # agent identity + MCP tools for Claude Code
-gatehouse-connect codex                       # same for Codex (T3 Code uses these configs)
-gatehouse-admin grant add --agent claude-code --account "My account" --for forever
-```
+1. Download **Gatehouse.zip** from the [latest release](https://github.com/Quentin-Gigon/gatehouse/releases/latest) and double-click it.
+2. Drag **Gatehouse** into your **Applications** folder and open it.
+   macOS may say it "can't be checked for malicious software", because this free app isn't signed with a paid Apple developer account. Open **System Settings › Privacy & Security**, scroll down, and click **Open Anyway**. You only need to do this once.
+3. Click **Set Up Gatehouse** and enter your Mac password. Setup takes a few minutes.
 
-Then ask the agent to do something on that site. It signs in with the `gatehouse` tools and works in the `gatehouse-browser` tools. Full guide: `docs/DEPLOYMENT.md`.
+That's it. Gatehouse lives in the menu bar (the shield icon) and starts with your Mac.
 
-Day to day:
+## Use it
 
-```sh
-gatehouse-admin handoff                       # solve a CAPTCHA / enter a code an agent is waiting on
-gatehouse-admin approvals                     # requests waiting for you
-gatehouse-admin approve apr_... --for 2026-12-31
-gatehouse-admin grant list --names
-gatehouse-admin grant revoke grt_...
-gatehouse-admin audit
-gatehouse-admin logins disable                # stop all new logins at once
-gatehouse-admin import ~/Downloads/Passwords.csv
-```
+1. **Connect your AI apps.** In **Agents**, click **Connect** next to Claude Code, Codex or Claude Desktop, then restart that app. (T3 Code uses the Claude Code and Codex connections.)
+2. **Add websites.** In **Websites**, click **+** and fill in the sign-in page, your username and password. Or click **Import** to pick logins from Apple Passwords, Chrome, 1Password or Bitwarden.
+3. **Say who may use each website.** Select a website and switch on the agents that may sign in to it.
+4. **Ask your agent.** For example: *"Use the gatehouse tools to sign in to Moodle and list this week's assignments."*
 
-To try it without installing anything system-wide, run `./run-demo.sh`, which uses a local fake site and throwaway state.
+Changing anything asks for your Mac password or Touch ID. That's on purpose: your agents run as you, but they don't know your password, so they can't give themselves access.
 
-## How a login works
+When a website shows a CAPTCHA, you get a notification. Click it, solve the check in the window that opens, and the agent carries on.
 
-1. The agent calls `request_login(account_id)`.
-2. The broker checks the agent's signature, the grant, the account's approved websites, the global switch and the failure counter.
-3. It disconnects the agent from the browser, closes the agent's tabs, and opens a fresh tab on the account's sign-in page.
-4. Before each field is filled, a script checks in the same step that the page is on an approved website and that the form posts to one. The script runs in an isolated JavaScript world that the page cannot tamper with, and the page's address is taken from the browser, not from the page.
-5. It submits once. Wrong password means `login_failed`; after two rejections the account is blocked until you run `gatehouse-admin account unblock`.
-6. If the site shows a CAPTCHA or asks for a code it cannot type itself, it waits for you (`gatehouse-admin handoff`).
-7. On success it opens the signed-in page in a new tab and destroys the login tab, so its history, which holds the filled form, cannot be revisited. The agent reconnects and continues there.
+## What it protects, and what it doesn't
 
-## What it does not do
+**Protected:**
+- **Your passwords.** They sit in an encrypted vault that only Gatehouse's own hidden system user can open. Agents can't read the file, can't ask for it, and never see the password typed.
+- **Who can sign in where.** Only you, with your Mac password, can give access. An agent can't grant itself anything.
+- **Session cookies.** Agents can't copy them out through the browser tools.
 
-- It does not make an agent harmless inside an account. A signed-in agent can do what the website lets that session do. Approval of individual actions (sending email, purchases) is the agent harness's job; see `docs/THREAT_MODEL.md`.
-- Revoking a grant stops future use of the credential. It does not end a website session the agent already holds; `logout` clears the local session only.
-- It does not bypass CAPTCHA or MFA (you solve those through `gatehouse-admin handoff`), and does not handle passkeys, "Sign in with Google/Apple", or login forms inside iframes.
-- Run as your own macOS user (development mode), it is **not** a strong boundary against an agent with an unrestricted shell. The macOS installer runs it as a separate user for that reason.
+**Not protected:**
+- **What an agent does once signed in.** It can do anything that website lets you do. Only allow agents on accounts where you're comfortable with that, and keep your bank and main email out of it.
+- **Sites that expose their login to page scripts.** A few websites make part of the login readable to the page itself, and a misbehaving agent could copy it. If you suspect misuse: disconnect the agent, then use the website's own "sign out everywhere".
+- **Passkeys, "Sign in with Google/Apple", and codes sent by text or email.** Those need you. Codes from an authenticator app can be automated: add the setup key to the website in Gatehouse.
 
-## Documentation
+**Why it can't use your Safari or Chrome:** agents sign in inside Gatehouse's browser, never yours. If Gatehouse typed into your own browser, the login would sit in your user account, where any agent could read it. So it doesn't matter which browser you use, and agents that control your screen also do the signed-in part in the Gatehouse browser.
 
-- `docs/ARCHITECTURE.md`: components, decisions, what is and is not built
-- `docs/THREAT_MODEL.md`: what the agent can and cannot see, residual risks
-- `docs/API.md`: HTTP API, MCP tools, browser relay
-- `docs/IMPORT.md`: CSV formats and import behaviour
-- `docs/DEPLOYMENT.md`: macOS install, connecting Claude Code / Codex / T3, CAPTCHA handoff, backup, upgrade
-- `SECURITY.md`: reporting vulnerabilities
+## When a website doesn't sign in
 
-## Tests
+Open the website in Gatehouse, click **Edit › Advanced**:
 
-```sh
-uv venv --python 3.12 && uv pip install -e ".[dev]"
-.venv/bin/python -m pytest
-```
+- **Button to click first:** for sites whose sign-in page starts with a "Sign in with email" button. Example for Goodreads: `button.authPortalSignInButton`.
+- **Other websites used to sign in:** for sites that send you to a separate login domain, such as `login.microsoftonline.com`.
+- **Only present when signed in:** something on the page that only exists once you're signed in. It makes success detection more reliable.
 
-The integration tests start a real Chromium and a synthetic login site on localhost. `tests/test_attacks.py` holds the attacks found in review (hostile pages, back/reload after login, cancel races); each must fail to expose the password. All credentials in the repository are fake.
+Still stuck? [Open an issue](https://github.com/Quentin-Gigon/gatehouse/issues) with the website and what the agent reported (never include your password).
+
+## For developers
+
+Gatehouse is a Python service (`src/gatehouse`) that runs as a hidden `_gatehouse` user under launchd, with a SwiftUI menu-bar app (`app/`) on top. Agents talk to it over MCP: one server for sign-in requests, plus the [Playwright MCP](https://github.com/microsoft/playwright-mcp) browser tool connected to a filtered DevTools relay.
+
+- Command line instead of the app: `sudo deploy/macos/install.sh`, then `gatehouse-admin` and `gatehouse-connect`. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+- Build the app: `app/build.sh` (Command Line Tools are enough). It produces `dist/Gatehouse.app`.
+- Try it without installing: `./run-demo.sh`, which uses a local fake site.
+- Tests: `uv venv --python 3.12 && uv pip install -e ".[dev]" && .venv/bin/python -m pytest`. They start a real Chromium against a synthetic login site. `tests/test_attacks.py` holds the attacks found in review.
+
+Docs: [architecture](docs/ARCHITECTURE.md) · [threat model](docs/THREAT_MODEL.md) · [API](docs/API.md) · [import formats](docs/IMPORT.md) · [deployment](docs/DEPLOYMENT.md) · [security policy](SECURITY.md)
 
 ## License
 
-Apache-2.0.
+Apache-2.0. All credentials in this repository are fake.

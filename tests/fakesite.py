@@ -25,6 +25,10 @@ class Site:
     def app(self) -> web.Application:
         app = web.Application()
         r = app.router
+        r.add_get("/sso-start", self.sso_start)
+        r.add_get("/sso-login", self.sso_login)
+        r.add_post("/sso-post", self.sso_post)
+        r.add_post("/sso-finish", self.sso_finish)
         r.add_get("/login", self.login_page)
         r.add_post("/login", self.login_post)
         r.add_get("/home", self.home)
@@ -51,6 +55,27 @@ class Site:
 
     def html(self, body: str) -> web.Response:
         return web.Response(text=body, content_type="text/html")
+
+    async def sso_start(self, request):
+        raise web.HTTPFound(self.other_origin + "/sso-login")
+
+    async def sso_login(self, request):
+        return self.html(FORM.format(action="/sso-post", extra=""))
+
+    async def sso_post(self, request):
+        data = await request.post()
+        self.posts += 1
+        assert data.get("password") == PASSWORD
+        return self.html("<html><body><form method='post' action='" + self.approved + "/sso-finish'>"
+                         "<input type='hidden' name='SAMLResponse' value='synthetic-assertion'></form>"
+                         "<script>setTimeout(() => document.forms[0].submit(), 1800)</script></body></html>")
+
+    async def sso_finish(self, request):
+        data = await request.post()
+        assert data.get("SAMLResponse") == "synthetic-assertion"
+        resp = web.HTTPFound("/home")
+        resp.set_cookie("session", "ok", httponly=True)
+        raise resp
 
     async def login_page(self, request):
         if request.cookies.get("session") == "ok":

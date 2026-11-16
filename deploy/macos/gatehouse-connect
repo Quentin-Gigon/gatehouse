@@ -7,7 +7,7 @@
 #   gatehouse-connect NAME claude|codex|desktop|none
 #
 # Registers agent NAME with the broker (asks for your Mac password once), stores its keys in
-# ~/.config/gatehouse/agent-NAME.json (owner-only), installs a pinned Playwright MCP browser
+# ~/.config/gatehouse/agent-NAME.json (owner-only), points the harness at the pinned Playwright MCP browser
 # tool, and adds two MCP servers to the harness at user scope:
 #   gatehouse          sign-in tools (list accounts, request login, status, logout)
 #   gatehouse-browser  the browser that holds the signed-in sessions
@@ -16,7 +16,6 @@
 set -euo pipefail
 
 PREFIX=@PREFIX@
-PLAYWRIGHT_MCP=@playwright/mcp@0.0.84
 
 NAME="${1:-}"
 if [[ -z "$NAME" || "$NAME" == -h || "$NAME" == --help ]]; then
@@ -44,18 +43,10 @@ field() { "$PREFIX/venv/bin/python" -I -c 'import json,sys; print(json.load(open
 ENDPOINT="$(field cdp_endpoint)"
 AGENT_ID="$(field agent_id)"
 
-# The browser tool, pinned and installed where the harness can always find it, whatever PATH it starts with.
-NODE="$(command -v node || true)"
-[[ -x "$NODE" ]] || { echo "Node.js is required for the browser tool (brew install node)" >&2; exit 1; }
-NPM="$(dirname "$NODE")/npm"; [[ -x "$NPM" ]] || NPM="$(command -v npm)"
-TOOLS="$CFG_DIR/browser-mcp"
-if [[ ! -f "$TOOLS/node_modules/@playwright/mcp/package.json" ]] || \
-   ! grep -q "\"version\": \"${PLAYWRIGHT_MCP##*@}\"" "$TOOLS/node_modules/@playwright/mcp/package.json"; then
-  echo "Installing $PLAYWRIGHT_MCP..."
-  install -d -m 700 "$TOOLS"
-  "$NPM" install --silent --no-audit --no-fund --prefix "$TOOLS" "$PLAYWRIGHT_MCP" >/dev/null
-fi
-CLI_JS="$TOOLS/node_modules/@playwright/mcp/cli.js"
+# The browser tool: pinned Node and Playwright MCP that the installer put in the root-owned $PREFIX.
+NODE="$PREFIX/node/bin/node"
+CLI_JS="$PREFIX/browser-mcp/node_modules/@playwright/mcp/cli.js"
+[[ -x "$NODE" && -f "$CLI_JS" ]] || { echo "the browser tool is missing; rerun the Gatehouse installer" >&2; exit 1; }
 
 MCP_CMD="$PREFIX/venv/bin/gatehouse-mcp"
 SIGNIN_JSON="{\"type\":\"stdio\",\"command\":\"$MCP_CMD\",\"env\":{\"GATEHOUSE_AGENT_CONFIG\":\"$CFG\"}}"

@@ -20,14 +20,43 @@ LABEL=com.gatehouse.broker
 UPDATE_LABEL=com.gatehouse.chrome-update
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 
-[[ $EUID -eq 0 ]] || exec sudo "$0" "$@"
+# Pinned tools, checked against these SHA-256 sums before use.
+UV_VERSION=0.13.6
+UV_SHA_ARM64=60fbd5c8a1ed681845eea28d9d622fcde03c51e91a43465b64a1e17db1ed3472
+UV_SHA_X64=63ba17fdda55ad1a230d4b37fc6017ffa10c23688c83818bd3bfdf914c652a02
+NODE_VERSION=v26.13.0
+NODE_SHA_ARM64=d38bd5e5a2ddce6bbb5ce45e46e208337da4d51fffe611e567fd32073d6439f6
+NODE_SHA_X64=525c9b29bb0263d687de60a4cec0e2a6db876a8eb032369e5795eca71e7c358e
+
+YES=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --yes) YES=1 ;;
+    --user) SUDO_USER="${2:?--user needs a name}"; shift ;;   # the app runs this as root without sudo
+    *) echo "usage: sudo $0 [--yes]" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+[[ $EUID -eq 0 ]] || exec sudo "$0" ${YES:+--yes}
 [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != root ]] || { echo "Run this with sudo from your own account." >&2; exit 1; }
-INVOKER_HOME="$(dscl . -read "/Users/$SUDO_USER" NFSHomeDirectory | awk '{print $2}')"
+dscl . -read "/Users/$SUDO_USER" >/dev/null 2>&1 || { echo "no such user: $SUDO_USER" >&2; exit 1; }
 
 step() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
+ARCH=arm64; [[ "$(uname -m)" == x86_64 ]] && ARCH=x64
+
+# fetch URL SHA256 OUT: download, and keep the file only if it matches the pinned hash
+fetch() {
+  local tmp; tmp="$(mktemp)"
+  curl -fsSL --retry 3 --max-time 900 "$1" -o "$tmp" || { rm -f "$tmp"; echo "download failed: $1" >&2; return 1; }
+  if [[ "$(shasum -a 256 "$tmp" | awk '{print $1}')" != "$2" ]]; then
+    rm -f "$tmp"; echo "checksum mismatch for $1; not installing it" >&2; return 1
+  fi
+  mv "$tmp" "$3"
+}
 
 # This script runs as root from a folder your agents can write to. Know what you are installing.
-if [[ "${1:-}" != --yes ]]; then
+if [[ -z "$YES" ]]; then
   rev="$(sudo -u "$SUDO_USER" git -C "$REPO" log -1 --format='%h %s' 2>/dev/null || echo 'not a git checkout')"
   dirty="$(sudo -u "$SUDO_USER" git -C "$REPO" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
   echo "Installing Gatehouse as root from $REPO"
@@ -69,10 +98,15 @@ install -d -o root -g wheel -m 755 "$PREFIX" "$PREFIX/bin" "$PREFIX/chrome"
 
 # --- Python and the gatehouse package -------------------------------------------
 step "Private Python and Gatehouse $(sed -n 's/^version = "\(.*\)"/\1/p' "$REPO/pyproject.toml")"
-UV_SRC="$(sudo -u "$SUDO_USER" -i command -v uv 2>/dev/null || true)"
-[[ -x "$UV_SRC" ]] || UV_SRC="$INVOKER_HOME/.local/bin/uv"
-[[ -x "$UV_SRC" ]] || { echo "uv is required: https://docs.astral.sh/uv/ (brew install uv)" >&2; exit 1; }
-install -o root -g wheel -m 755 "$UV_SRC" "$PREFIX/bin/uv"
+if [[ "$("$PREFIX/bin/uv" --version 2>/dev/null | awk '{print $2}')" != "$UV_VERSION" ]]; then
+  UV_TRIPLE=aarch64-apple-darwin; UV_SHA=$UV_SHA_ARM64
+  [[ $ARCH == x64 ]] && { UV_TRIPLE=x86_64-apple-darwin; UV_SHA=$UV_SHA_X64; }
+  UV_TMP="$(mktemp -d)"
+  fetch "https://github.com/astral-sh/uv/releases/download/$UV_VERSION/uv-$UV_TRIPLE.tar.gz" "$UV_SHA" "$UV_TMP/uv.tgz"
+  tar -xzf "$UV_TMP/uv.tgz" -C "$UV_TMP"
+  install -o root -g wheel -m 755 "$UV_TMP/uv-$UV_TRIPLE/uv" "$PREFIX/bin/uv"
+  rm -rf "$UV_TMP"
+fi
 export UV_PYTHON_INSTALL_DIR="$PREFIX/python" UV_CACHE_DIR="$PREFIX/.uv-cache" UV_NO_CONFIG=1
 "$PREFIX/bin/uv" python install --quiet --no-bin 3.12
 PY="$("$PREFIX/bin/uv" python find --managed-python 3.12)"
@@ -96,6 +130,27 @@ fi
 rm -rf "$PREFIX/venv.old"
 chown -R root:wheel "$PREFIX"
 "$PREFIX/venv/bin/gatehouse" --help >/dev/null && echo "gatehouse installed in $PREFIX/venv"
+# The app compares this with the version it carries to offer an update.
+sed -n 's/^version = "\(.*\)"/\1/p' "$REPO/pyproject.toml" > "$PREFIX/VERSION"
+
+# --- the agents' browser tool ---------------------------------------------------------
+step "Browser tool for agents (Node $NODE_VERSION, Playwright MCP)"
+if [[ "$("$PREFIX/node/bin/node" --version 2>/dev/null)" != "$NODE_VERSION" ]]; then
+  NODE_SHA=$NODE_SHA_ARM64; [[ $ARCH == x64 ]] && NODE_SHA=$NODE_SHA_X64
+  NODE_TMP="$(mktemp -d)"
+  fetch "https://nodejs.org/dist/$NODE_VERSION/node-$NODE_VERSION-darwin-$ARCH.tar.gz" "$NODE_SHA" "$NODE_TMP/node.tgz"
+  tar -xzf "$NODE_TMP/node.tgz" -C "$NODE_TMP"
+  rm -rf "$PREFIX/node"; mv "$NODE_TMP/node-$NODE_VERSION-darwin-$ARCH" "$PREFIX/node"
+  rm -rf "$NODE_TMP"
+fi
+# Exact versions and integrity hashes from the lockfile; no install scripts run.
+rm -rf "$PREFIX/browser-mcp.new"; mkdir -p "$PREFIX/browser-mcp.new"
+cp "$REPO/deploy/browser-mcp/package.json" "$REPO/deploy/browser-mcp/package-lock.json" "$PREFIX/browser-mcp.new/"
+( cd "$PREFIX/browser-mcp.new" && PATH="$PREFIX/node/bin:/usr/bin:/bin" HOME="$PREFIX/.npm-home" \
+    npm ci --ignore-scripts --no-audit --no-fund --silent --cache "$PREFIX/.npm-cache" )
+rm -rf "$PREFIX/browser-mcp" "$PREFIX/.npm-cache" "$PREFIX/.npm-home"; mv "$PREFIX/browser-mcp.new" "$PREFIX/browser-mcp"
+chown -R root:wheel "$PREFIX/node" "$PREFIX/browser-mcp"
+echo "$("$PREFIX/node/bin/node" --version), @playwright/mcp $("$PREFIX/node/bin/node" -p "require('$PREFIX/browser-mcp/node_modules/@playwright/mcp/package.json').version")"
 
 # --- helper scripts ----------------------------------------------------------------
 step "Commands"

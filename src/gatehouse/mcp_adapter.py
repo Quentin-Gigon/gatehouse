@@ -21,11 +21,11 @@ WAITING = ("in_progress", "human_verification_required")
 
 INSTRUCTIONS = """Gatehouse signs you in to websites the user has authorized, without ever showing you the password.
 
-- Call list_authorized_accounts to see which accounts you may use. If the account you need is not listed, ask the user to grant it (`gatehouse-admin grant add ...`); do not ask for the password.
-- Browse those sites only with the `gatehouse-browser` tools. They drive the browser that holds your signed-in sessions; any other browser tool is a different browser and is not signed in.
+- Call list_authorized_accounts to see which accounts you may use. If the account you need is not listed, ask the user to allow it in the Gatehouse app (Websites, then switch your app on); do not ask for the password.
+- Browse those sites only with the `gatehouse-browser` tools. They drive the browser that holds your signed-in sessions. Any other browser, including Safari or Chrome on the user's screen when you have computer use, is not signed in and never will be: do the signed-in part of the task in gatehouse-browser.
 - To sign in: open the site with gatehouse-browser, call request_login with the account_id, and on signed_in or already_signed_in continue in gatehouse-browser. The broker closes the browser connection while it types and your tabs are replaced by one signed-in tab; take a fresh snapshot before acting.
-- human_verification_required: the site wants a CAPTCHA or a code. Tell the user to run `gatehouse-admin handoff` in a terminal and finish it in the page that opens, then poll get_login_status.
-- permission_required: tell the user to run `gatehouse-admin approvals`. login_failed or permission_denied: stop and tell the user; never retry login_failed.
+- human_verification_required: the site wants a CAPTCHA or a code. Tell the user Gatehouse is waiting for them (the app shows a notification; in a terminal, `gatehouse-admin handoff`), then poll get_login_status.
+- permission_required: tell the user to open Gatehouse, Needs You, and allow or deny the request. login_failed or permission_denied: stop and tell the user; never retry login_failed.
 - Never type passwords or one-time codes yourself and never ask the user for them."""
 
 TOOLS = [
@@ -79,7 +79,7 @@ class Adapter:
             return None  # notification
         if method == "initialize":
             result = {"protocolVersion": (msg.get("params") or {}).get("protocolVersion", PROTOCOL),
-                      "capabilities": {"tools": {}}, "serverInfo": {"name": "gatehouse", "version": "0.2.0"},
+                      "capabilities": {"tools": {}}, "serverInfo": {"name": "gatehouse", "version": "0.3.0"},
                       "instructions": INSTRUCTIONS}
         elif method == "ping":
             result = {}

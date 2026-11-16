@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 
 from aiohttp import web
 
+from . import admin as A
 from . import login as L
 from .cdp import Browser, CDPError
 from .handoff import CODE_PAGE, GONE, PAGE, Handoff
@@ -23,6 +24,8 @@ from .vault import Vault
 
 CLOCK_SKEW = 60.0
 MAX_BODY = 64 * 1024
+MAX_ADMIN_BODY = 8 * 1024 * 1024      # a password-manager export
+ADMIN_IDLE = 900.0                    # the app re-asks for your Mac password after 15 idle minutes
 MAX_FAILURES = 2
 REQUEST_TTL = 3600.0
 REVOKE_POLL = 2.0
@@ -65,7 +68,7 @@ class Broker:
 
     # --- app -----------------------------------------------------------------
     def app(self) -> web.Application:
-        app = web.Application(client_max_size=MAX_BODY, middlewares=[self._local_only])
+        app = web.Application(client_max_size=MAX_ADMIN_BODY, middlewares=[self._local_only])
         r = app.router
         r.add_post("/v1/accounts", self._api(self.h_accounts))
         r.add_post("/v1/browser", self._api(self.h_browser))
@@ -80,6 +83,17 @@ class Broker:
         r.add_get("/handoff/{token}/", self.h_handoff_page)
         r.add_get("/handoff/{token}/ws", self.h_handoff_ws)
         r.add_post("/handoff/{token}/claim", self.h_handoff_claim)
+        r.add_get("/v1/attention", self.h_attention)
+        for path, fn in {
+            "overview": self.a_overview, "activity": self.a_activity, "lock": self.a_lock,
+            "account/add": self.a_account_add, "account/edit": self.a_account_edit,
+            "account/remove": self.a_account_remove, "account/unblock": self.a_account_unblock,
+            "import/preview": self.a_import_preview, "import/apply": self.a_import_apply,
+            "agent/connect": self.a_agent_connect, "agent/revoke": self.a_agent_revoke,
+            "access": self.a_access, "approval/approve": self.a_approve, "approval/deny": self.a_deny,
+            "logins": self.a_logins,
+        }.items():
+            r.add_post(f"/admin/{path}", self._admin(fn))
         app.on_startup.append(self._on_start)
         app.on_cleanup.append(self._on_stop)
         return app
@@ -128,6 +142,8 @@ class Broker:
     def _api(self, fn):
         async def handler(request: web.Request):
             body = await request.read()
+            if len(body) > MAX_BODY:
+                return web.json_response({"error": "request too large"}, status=413)
             h = request.headers
             agent_id, ts, nonce, sig = (h.get("X-GH-Agent", ""), h.get("X-GH-Timestamp", ""),
                                         h.get("X-GH-Nonce", ""), h.get("X-GH-Signature", ""))
@@ -154,6 +170,88 @@ class Broker:
                 return web.json_response({"error": "invalid JSON body"}, status=400)
             return web.json_response(await fn(agent_id, payload))
         return handler
+
+    def _admin(self, fn):
+        """Admin endpoints take a token that only `gatehouse admin-token` issues, and that command needs
+        the broker user's rights, i.e. your Mac password. No endpoint returns a password or TOTP secret."""
+        async def handler(request: web.Request):
+            auth = request.headers.get("Authorization", "")
+            token = auth[7:] if auth.startswith("Bearer ") else ""
+            if not token or not self.store.use_admin_token(token, ADMIN_IDLE):
+                return web.json_response({"error": "locked"}, status=401)
+            try:
+                payload = json.loads(await request.read() or b"{}")
+                if not isinstance(payload, dict):
+                    raise ValueError
+            except ValueError:
+                return web.json_response({"error": "invalid JSON body"}, status=400)
+            if self.key is None:
+                return web.json_response({"error": "the vault is locked"}, status=409)
+            try:
+                return web.json_response(fn(payload, token))
+            except A.AdminError as e:
+                return web.json_response({"error": str(e)}, status=400)
+        return handler
+
+    # --- admin API (the app) ----------------------------------------------------------
+    def a_overview(self, p: dict, token: str) -> dict:
+        handoffs = [{**h.public(), "url": f"http://127.0.0.1:{self.port}/handoff/{h.token}"} for h in self.handoffs.values()]
+        return A.overview(self.store, self.vault, self.key, self.boot_id, handoffs)
+
+    def a_activity(self, p: dict, token: str) -> dict:
+        return {"rows": A.activity(self.store, self.vault, self.key, int(p.get("limit") or 200))}
+
+    def a_lock(self, p: dict, token: str) -> dict:
+        self.store.revoke_admin_token(token)
+        return {}
+
+    def a_account_add(self, p: dict, token: str) -> dict:
+        return A.add_account(self.store, self.vault, self.key, p)
+
+    def a_account_edit(self, p: dict, token: str) -> dict:
+        return A.edit_account(self.store, self.vault, self.key, p)
+
+    def a_account_remove(self, p: dict, token: str) -> dict:
+        return A.remove_account(self.store, self.vault, self.key, p)
+
+    def a_account_unblock(self, p: dict, token: str) -> dict:
+        return A.unblock_account(self.store, p)
+
+    def a_import_preview(self, p: dict, token: str) -> dict:
+        return A.import_preview(p)
+
+    def a_import_apply(self, p: dict, token: str) -> dict:
+        return A.import_apply(self.store, self.vault, self.key, p)
+
+    def a_agent_connect(self, p: dict, token: str) -> dict:
+        return A.connect_agent(self.store, str(p.get("name") or ""), self.port)
+
+    def a_agent_revoke(self, p: dict, token: str) -> dict:
+        return A.revoke_agent(self.store, p)
+
+    def a_access(self, p: dict, token: str) -> dict:
+        return A.set_access(self.store, self.vault, self.key, self.boot_id, p)
+
+    def a_approve(self, p: dict, token: str) -> dict:
+        return A.approve(self.store, self.vault, self.key, self.boot_id, p)
+
+    def a_deny(self, p: dict, token: str) -> dict:
+        return A.deny(self.store, p)
+
+    def a_logins(self, p: dict, token: str) -> dict:
+        return A.set_logins(self.store, p)
+
+    async def h_attention(self, request: web.Request):
+        """What the app's menu-bar icon shows without being unlocked: who is waiting for you, nothing more."""
+        agents = {a["id"]: a["name"] for a in self.store.agents()}
+        names = {c.id: c.name for c in self.vault.load(self.key)} if self.key else {}
+        return web.json_response({
+            "running": True, "vault_unlocked": self.key is not None,
+            "handoffs": [{"request_id": h.request_id, "agent": agents.get(h.agent_id, ""),
+                          "account": names.get(h.account_id, ""), "origin": h.origin} for h in self.handoffs.values()],
+            "approvals": len(self.store.approvals()),
+            "logins_disabled": self.store.logins_disabled(),
+        })
 
     # --- browser sessions ------------------------------------------------------
     async def browser_for(self, agent_id: str) -> Browser:

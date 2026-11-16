@@ -1,0 +1,26 @@
+name: release
+# Tag vX.Y.Z (matching pyproject.toml) to build Gatehouse.app and publish it as a GitHub release.
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  app:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the tag matches the version
+        run: |
+          v="$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml)"
+          [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME but pyproject says $v"; exit 1; }
+      - name: Build (Apple Silicon and Intel)
+        run: app/build.sh --universal
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shasum -a 256 dist/Gatehouse.zip | tee dist/Gatehouse.zip.sha256
+          gh release create "$GITHUB_REF_NAME" dist/Gatehouse.zip dist/Gatehouse.zip.sha256 \
+            --title "Gatehouse ${GITHUB_REF_NAME#v}" \
+            --notes "Download Gatehouse.zip, unzip it, move Gatehouse to Applications and open it. The first time, macOS asks you to confirm in System Settings › Privacy & Security › Open Anyway (the app is not notarized)."
