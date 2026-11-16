@@ -25,6 +25,13 @@ enum Paths {
         return nil
     }
 
+    /// Version plus the fingerprint of the bundled service files, as the installer records it.
+    static var bundledBuild: String? {
+        guard let v = bundledVersion, let p = payload?.appendingPathComponent("BUILD"),
+              let b = try? String(contentsOf: p, encoding: .utf8) else { return nil }
+        return v + "+" + b.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     static var isInstalled: Bool {
         FileManager.default.fileExists(atPath: daemonPlist) && FileManager.default.fileExists(atPath: admin)
     }
@@ -110,11 +117,12 @@ final class BrokerAPI {
     }()
 
     enum APIError: LocalizedError {
-        case locked, notRunning, server(String)
+        case locked, notRunning, outdated, server(String)
         var errorDescription: String? {
             switch self {
             case .locked: return "Gatehouse is locked."
             case .notRunning: return "The Gatehouse service isn't running."
+            case .outdated: return "The Gatehouse service on this Mac is older than this app. Open Settings and click Update Service, then try again."
             case .server(let m): return m
             }
         }
@@ -149,6 +157,7 @@ final class BrokerAPI {
             self.token = nil
             throw APIError.locked
         }
+        if status == 404 { throw APIError.outdated }
         if status != 200 {
             let msg = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["error"] as? String
             throw APIError.server(msg ?? "The service answered with an error (\(status)).")
@@ -173,6 +182,7 @@ final class BrokerAPI {
         let (data, resp) = try await session.data(for: req)
         let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
         if status == 401 { self.token = nil; throw APIError.locked }
+        if status == 404 { throw APIError.outdated }
         guard status == 200 else {
             let msg = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["error"] as? String
             throw APIError.server(msg ?? "The service answered with an error (\(status)).")

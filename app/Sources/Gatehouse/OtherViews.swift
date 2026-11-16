@@ -352,7 +352,7 @@ struct SettingsView: View {
             Section("Service") {
                 LabeledContent("Status", value: model.service == .running ? "Running" : "Not running")
                 LabeledContent("Installed version", value: Paths.installedVersionString ?? "–")
-                LabeledContent("This app's version", value: Paths.bundledVersion ?? "–")
+                LabeledContent("This app's version", value: Paths.bundledBuild ?? Paths.bundledVersion ?? "–")
                 HStack {
                     Button(model.needsUpdate ? "Update Service" : "Repair Service") { Task { await model.install() } }
                     Spacer()

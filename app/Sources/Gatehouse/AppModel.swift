@@ -36,7 +36,9 @@ final class AppModel: ObservableObject {
 
     var needsUpdate: Bool {
         // Installs from before the app wrote no VERSION file: those need the update too.
-        guard Paths.isInstalled, let b = Paths.bundledVersion else { return false }
+        // Compares version and the fingerprint of the service files, so a rebuilt app with the same
+        // version number still updates the service.
+        guard Paths.isInstalled, let b = Paths.bundledBuild ?? Paths.bundledVersion else { return false }
         return Paths.installedVersionString != b
     }
 

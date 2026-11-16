@@ -23,9 +23,16 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/payload"
 cp "$BIN" "$APP/Contents/MacOS/Gatehouse"
 cp "$APP_DIR/Resources/AppIcon.icns" "$APP/Contents/Resources/" 2>/dev/null || true
 
-# The service the app installs: only tracked files, so nothing local (venvs, state) slips in.
-git -C "$REPO" ls-files -z --cached --others --exclude-standard src deploy pyproject.toml README.md LICENSE \
-  | (cd "$REPO" && xargs -0 tar -cf -) | tar -xf - -C "$APP/Contents/Resources/payload"
+# The service the app installs: exactly what is committed, so nothing local (venvs, state, unfinished
+# edits) slips in. Commit first to ship a change.
+if [[ -n "$(git -C "$REPO" status --porcelain -- src deploy pyproject.toml)" ]]; then
+  echo "note: uncommitted changes in src/, deploy/ or pyproject.toml are NOT included" >&2
+fi
+git -C "$REPO" archive HEAD src deploy pyproject.toml README.md LICENSE | tar -xf - -C "$APP/Contents/Resources/payload"
+# Fingerprint of the bundled service, so the app notices any difference from the installed one,
+# not just a different version number.
+(cd "$APP/Contents/Resources/payload" && find . -type f | LC_ALL=C sort | xargs shasum -a 256 | shasum -a 256 | cut -c1-12) \
+  > "$APP/Contents/Resources/payload/BUILD"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

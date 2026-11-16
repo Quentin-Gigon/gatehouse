@@ -133,7 +133,7 @@ struct UpdateView: View {
         VStack(spacing: 16) {
             Image(systemName: "arrow.down.circle").font(.system(size: 48)).foregroundStyle(.tint)
             Text("Update the Gatehouse service").font(.title2.bold())
-            Text("This app is newer than the service on your Mac (\(Paths.installedVersionString ?? "older version") → \(Paths.bundledVersion ?? "?")). Updating keeps your websites, agents and their access, and asks for your Mac password once.")
+            Text("This app is newer than the service on your Mac (\(Paths.installedVersionString ?? "older version") → \(Paths.bundledBuild ?? Paths.bundledVersion ?? "?")). Updating keeps your websites, agents and their access, and asks for your Mac password once.")
                 .multilineTextAlignment(.center).foregroundStyle(.secondary).frame(maxWidth: 480)
             Button { Task { await model.install() } } label: { Text(model.busy == nil ? "Update" : "Updating…").frame(minWidth: 140) }
                 .buttonStyle(.borderedProminent).controlSize(.large).disabled(model.busy != nil)

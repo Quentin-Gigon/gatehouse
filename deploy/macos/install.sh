@@ -131,7 +131,8 @@ rm -rf "$PREFIX/venv.old"
 chown -R root:wheel "$PREFIX"
 "$PREFIX/venv/bin/gatehouse" --help >/dev/null && echo "gatehouse installed in $PREFIX/venv"
 # The app compares this with the version it carries to offer an update.
-sed -n 's/^version = "\(.*\)"/\1/p' "$REPO/pyproject.toml" > "$PREFIX/VERSION"
+# VERSION+BUILD, BUILD being the app's fingerprint of these files (empty when installed from a checkout).
+echo "$(sed -n 's/^version = "\(.*\)"/\1/p' "$REPO/pyproject.toml")+$(cat "$REPO/BUILD" 2>/dev/null)" > "$PREFIX/VERSION"
 
 # --- the agents' browser tool ---------------------------------------------------------
 step "Browser tool for agents (Node $NODE_VERSION, Playwright MCP)"
