@@ -16,14 +16,19 @@ PLATFORM=mac-arm64; [[ "$(uname -m)" == x86_64 ]] && PLATFORM=mac-x64
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] update-chrome: $*"; }
 
-# Accept an app only if it is signed by Google and the signature is intact, or (Chrome for
-# Testing builds, fetched over HTTPS from Google) carries no signature at all.
-check_app() {
-  local app="$1" info
-  if info="$(codesign -dv --verbose=2 "$app" 2>&1)" && ! grep -q "not signed at all" <<<"$info"; then
-    codesign --verify --deep --strict "$app" || { log "signature check failed for $app"; return 1; }
-    grep -q "TeamIdentifier=$GOOGLE_TEAM" <<<"$info" || { log "$app is not signed by Google"; return 1; }
-  fi
+# Signed by Google with an intact signature. Nothing else: no ad-hoc, no other team, no unsigned.
+check_app_strict() {
+  local app="$1"
+  codesign --verify --deep --strict "$app" || { log "signature check failed for $app"; return 1; }
+  codesign -dv --verbose=2 "$app" 2>&1 | grep -qx "TeamIdentifier=$GOOGLE_TEAM" || { log "$app is not signed by Google"; return 1; }
+}
+
+# Chrome for Testing, fetched over HTTPS straight from Google: strict if it carries a signature,
+# accepted unsigned (some builds are). Never used for anything that came from a writable folder.
+check_cft() {
+  local app="$1"
+  if codesign -dv "$app" 2>&1 | grep -q "not signed at all"; then return 0; fi
+  check_app_strict "$app"
 }
 
 activate() {  # activate VERSION_DIR BINARY_RELATIVE_PATH
@@ -54,8 +59,7 @@ print(s["version"], next(d["url"] for d in s["downloads"]["chrome"] if d["platfo
   log "installing Chrome for Testing $version"
   tmp="$target.tmp"; rm -rf "$tmp"; mkdir -p "$tmp"
   if curl -fsSL --max-time 900 "$url" -o "$tmp/chrome.zip" && ditto -x -k "$tmp/chrome.zip" "$tmp" && rm "$tmp/chrome.zip" \
-     && check_app "$tmp/chrome-$PLATFORM/Google Chrome for Testing.app"; then
-    xattr -rc "$tmp" 2>/dev/null || true
+     && xattr -cr "$tmp" && check_cft "$tmp/chrome-$PLATFORM/Google Chrome for Testing.app"; then
     chown -R root:wheel "$tmp"
     rm -rf "$target"; mv "$tmp" "$target"
     activate "$target" "$bin"
@@ -73,12 +77,15 @@ fi
 
 src="/Applications/Google Chrome.app"
 [[ -d "$src" ]] || { log "no browser available: install Google Chrome or check the network, then rerun"; exit 1; }
-version="$(defaults read "$src/Contents/Info" CFBundleShortVersionString)"
+version="$(defaults read "$src/Contents/Info" CFBundleShortVersionString 2>/dev/null || true)"
+# The app is writable by a non-root account: its version string only names a folder after it passes this.
+[[ "$version" =~ ^[0-9]+(\.[0-9]+){0,3}$ ]] || { log "unexpected Chrome version string; not copying"; exit 1; }
 target="$DIR/chrome-$version"
 log "falling back to a verified copy of Google Chrome $version"
 rm -rf "$target.tmp"; mkdir -p "$target.tmp"
 ditto "$src" "$target.tmp/Google Chrome.app"
-check_app "$target.tmp/Google Chrome.app" || { rm -rf "$target.tmp"; exit 1; }
+xattr -cr "$target.tmp/Google Chrome.app"   # Finder/quarantine metadata is not signed and fails --strict
+check_app_strict "$target.tmp/Google Chrome.app" || { rm -rf "$target.tmp"; exit 1; }
 chown -R root:wheel "$target.tmp"
 rm -rf "$target"; mv "$target.tmp" "$target"
 activate "$target" "Google Chrome.app/Contents/MacOS/Google Chrome"
