@@ -96,7 +96,8 @@ def cmd_init(c: Ctx) -> None:
     if c.vault.exists():
         die("already initialized")
     p1 = read_passphrase(c.args, "Choose a vault passphrase (min 8 characters): ")
-    if not getattr(c.args, "passphrase_file", None) and p1 != getpass.getpass("Repeat: "):
+    from_file = getattr(c.args, "passphrase_file", None) or os.environ.get("GATEHOUSE_PASSPHRASE_FILE")
+    if not from_file and p1 != getpass.getpass("Repeat: "):
         die("passphrases differ")
     try:
         c.vault.create(p1)
@@ -286,13 +287,18 @@ def cmd_agent_add(c: Ctx) -> None:
     a = s.add_agent(c.args.name)
     port = s.get_setting("port", str(DEFAULT_PORT))
     cfg = {"url": f"http://127.0.0.1:{port}", "agent_id": a["agent_id"], "sign_key": a["sign_key"]}
+    endpoint = f"http://127.0.0.1:{port}/cdp/{a['cdp_token']}"
+    if c.args.write_config == "-":
+        # Machine-readable, for a setup script running as the agent's user to store itself.
+        print(json.dumps({**cfg, "cdp_endpoint": endpoint}))
+        return
     out = Path(c.args.write_config).expanduser()
     fd = os.open(out, os.O_CREAT | os.O_WRONLY | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w") as f:
         json.dump(cfg, f)
     print(f"Agent {a['agent_id']} created.")
     print(f"  API config for the MCP adapter written to {out} (owner-only).")
-    print(f"  Browser endpoint for the agent's browser tool (shown once):\n    http://127.0.0.1:{port}/cdp/{a['cdp_token']}")
+    print(f"  Browser endpoint for the agent's browser tool (shown once):\n    {endpoint}")
     print("Whoever holds these can act as this agent. They grant nothing until you add a grant.")
 
 
@@ -367,6 +373,24 @@ def cmd_approvals(c: Ctx) -> None:
         print(f"{r['id']}  agent {r['agent_id']} wants account {r['credential_id']} on {r['origin']}  ({when(r['created_at'])})")
     if not rows:
         print("No pending approvals.")
+
+
+def cmd_handoff(c: Ctx) -> None:
+    s = c.store
+    port = s.get_setting("port", str(DEFAULT_PORT))
+    pending = json.loads(s.get_setting("handoffs", "[]") or "[]") if s.get_setting("boot_id") else []
+    if c.args.urls:
+        for h in pending:
+            print(f"http://127.0.0.1:{port}/handoff/{h['token']}")
+        return
+    if not pending:
+        print("No sign-in is waiting for you.")
+        return
+    names = {x.id: x.name for x in c.vault.load(c.key)}
+    for h in pending:
+        print(f"{names.get(h['account_id'], h['account_id'])} on {h['origin']} (agent {h['agent_id']}, "
+              f"waiting since {when(h['created_at'])}):\n  http://127.0.0.1:{port}/handoff/{h['token']}")
+    print("Open the link in your browser. The first browser to open it is the only one that can use it.")
 
 
 def cmd_approve(c: Ctx) -> None:
@@ -451,7 +475,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     ag = sub.add_parser("agent", help="manage agents").add_subparsers(dest="sub", required=True)
     sp = add(ag, "add", cmd_agent_add, "register an agent and issue its keys")
-    sp.add_argument("name"); sp.add_argument("--write-config", required=True, help="where to write the agent's API config")
+    sp.add_argument("name"); sp.add_argument("--write-config", required=True, help="where to write the agent's API config; '-' prints it, with the browser endpoint, as JSON")
     add(ag, "list", cmd_agent_list, "list agents")
     add(ag, "revoke", cmd_agent_revoke, "revoke an agent entirely").add_argument("agent")
 
@@ -464,6 +488,8 @@ def build_parser() -> argparse.ArgumentParser:
     add(gr, "revoke", cmd_grant_revoke, "revoke a grant").add_argument("grant")
 
     add(sub, "approvals", cmd_approvals, "list requests waiting for you")
+    add(sub, "handoff", cmd_handoff, "links for sign-ins waiting on a CAPTCHA or code from you").add_argument(
+        "--urls", action="store_true", help="print only the links")
     sp = add(sub, "approve", cmd_approve, "approve a pending request")
     sp.add_argument("approval"); sp.add_argument("--for", dest="duration", required=True)
     add(sub, "deny", cmd_deny, "deny a pending request").add_argument("approval")

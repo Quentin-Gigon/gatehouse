@@ -35,6 +35,7 @@ class Site:
         r.add_post("/totp-login", self.totp_post)
         r.add_post("/otp", self.otp_post)
         r.add_get("/captcha-login", self.captcha_page)
+        r.add_post("/solve", self.solve)
         r.add_get("/collect", self.collect)
         r.add_get("/planted.js", self.planted)
         return app
@@ -102,8 +103,14 @@ class Site:
     async def captcha_page(self, request):
         if self.captcha_solved:
             return self.html(FORM.format(action="/login", extra=""))
-        return self.html("<html><head><meta http-equiv='refresh' content='1'></head><body>"
-                         "<div class='g-recaptcha'>Prove you are human</div></body></html>")
+        return self.html("<html><head><meta http-equiv='refresh' content='1'></head><body style='margin:0'>"
+                         "<div class='g-recaptcha'>Prove you are human</div>"
+                         "<button id='human' style='position:absolute;left:0;top:0;width:300px;height:200px' "
+                         "onclick=\"fetch('/solve',{method:'POST'})\">I am human</button></body></html>")
+
+    async def solve(self, request):
+        self.captcha_solved = True
+        return web.Response(text="ok")
 
     async def collect(self, request):
         self.collected.append(request.query.get("d", ""))

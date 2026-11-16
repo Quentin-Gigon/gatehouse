@@ -14,6 +14,7 @@ from aiohttp import web
 
 from . import login as L
 from .cdp import Browser, CDPError
+from .handoff import GONE, PAGE, Handoff
 from .config import Paths
 from .origins import origin_of
 from .policy import authorize, visible_accounts
@@ -59,6 +60,7 @@ class Broker:
         self.session_ids: dict[str, str] = {}
         self.requests: dict[str, LoginRequest] = {}
         self._browser_locks: dict[str, asyncio.Lock] = {}
+        self.handoffs: dict[str, Handoff] = {}
 
     # --- app -----------------------------------------------------------------
     def app(self) -> web.Application:
@@ -73,6 +75,9 @@ class Broker:
         r.add_get("/cdp/{token}/json/version", self.h_cdp_version)
         r.add_get("/cdp/{token}/json/version/", self.h_cdp_version)
         r.add_get("/cdp/{token}/devtools/browser", self.h_cdp_ws)
+        r.add_get("/handoff/{token}", self.h_handoff_page)
+        r.add_get("/handoff/{token}/", self.h_handoff_page)
+        r.add_get("/handoff/{token}/ws", self.h_handoff_ws)
         app.on_startup.append(self._on_start)
         app.on_cleanup.append(self._on_stop)
         return app
@@ -80,11 +85,13 @@ class Broker:
     async def _on_start(self, app) -> None:
         self.store.set_setting("boot_id", self.boot_id)
         self.store.set_setting("port", str(self.port))
+        self.store.set_setting("handoffs", "[]")
         self.store.prune_audit()
         self.store.audit("broker_started", result="unlocked" if self.key else "locked")
 
     async def _on_stop(self, app) -> None:
         self.store.set_setting("boot_id", "")
+        self.store.set_setting("handoffs", "[]")
         for req in self.requests.values():
             if req.task and not req.task.done():
                 req.task.cancel()
@@ -95,7 +102,11 @@ class Broker:
     async def _local_only(self, request: web.Request, handler):
         """Refuse anything that looks like it came from a web page (DNS rebinding, cross-site requests)."""
         host = request.headers.get("Host", "")
-        if host not in (f"127.0.0.1:{self.port}", f"localhost:{self.port}") or "Origin" in request.headers:
+        own = (f"127.0.0.1:{self.port}", f"localhost:{self.port}")
+        origin = request.headers.get("Origin")
+        # The handoff page is the one thing a browser legitimately opens; it may only talk to itself.
+        same_page = request.path.startswith("/handoff/") and origin == f"http://{host}"
+        if host not in own or (origin is not None and not same_page):
             return web.json_response({"error": "forbidden"}, status=403)
         return await handler(request)
 
@@ -210,8 +221,15 @@ class Broker:
                     status, detail = L.PERMISSION_DENIED, "revoked_before_use"
                     return
                 await browser.close_gate()
-                run = L.LoginRun(browser, cred, allowed, self.timeouts,
-                                 on_status=lambda s, d: (setattr(req, "status", s), setattr(req, "detail", d)))
+
+                def on_status(s: str, d: str) -> None:
+                    req.status, req.detail = s, d
+                    if s == L.HUMAN:
+                        self._open_handoff(req, browser, run.sid)
+                    else:
+                        self._close_handoffs(req.id)
+
+                run = L.LoginRun(browser, cred, allowed, self.timeouts, on_status=on_status)
                 req.detail = "signing_in"
                 try:
                     await run.open_tab()
@@ -224,6 +242,7 @@ class Broker:
         except CDPError:
             status, detail = L.FAILED, "browser_error"
         finally:
+            self._close_handoffs(req.id)
             if browser is not None:
                 browser.open_gate()
             if status == L.FAILED and detail in ("credentials_rejected", "code_rejected"):
@@ -235,6 +254,58 @@ class Broker:
                 self.store.request_approval(req.agent_id, cred.id, run.unapproved_origin)
             req.status, req.detail = status, detail
             self.store.audit("login_result", req.agent_id, cred.id, req.origin, "allowed", f"{status}:{detail}")
+
+    # --- human handoff ---------------------------------------------------------------
+    def _open_handoff(self, req: LoginRequest, browser: Browser, session_id: str) -> None:
+        if any(h.request_id == req.id for h in self.handoffs.values()):
+            return
+        h = Handoff(req.id, req.agent_id, req.credential_id, req.origin, browser, session_id)
+        self.handoffs[h.token] = h
+        self._publish_handoffs()
+        self.store.audit("handoff_opened", req.agent_id, req.credential_id, req.origin, "allowed")
+
+    def _close_handoffs(self, request_id: str) -> None:
+        for token in [t for t, h in self.handoffs.items() if h.request_id == request_id]:
+            self.handoffs.pop(token).close()
+        self._publish_handoffs()
+
+    def _publish_handoffs(self) -> None:
+        # Readable only by the management CLI (the broker user's own state file), never by agents.
+        self.store.set_setting("handoffs", json.dumps([h.public() for h in self.handoffs.values()]))
+
+    def _handoff(self, request: web.Request) -> Handoff | None:
+        return self.handoffs.get(request.match_info["token"])
+
+    @staticmethod
+    def _html(body: str, status: int = 200, **headers) -> web.Response:
+        return web.Response(text=body, content_type="text/html", status=status, headers={
+            "Cache-Control": "no-store", "Referrer-Policy": "no-referrer", "X-Frame-Options": "DENY",
+            "Content-Security-Policy": "default-src 'none'; img-src data:; style-src 'unsafe-inline'; "
+                                       "script-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'",
+            **headers})
+
+    async def h_handoff_page(self, request: web.Request):
+        h = self._handoff(request)
+        if h is None:
+            return self._html(GONE.replace("__MESSAGE__", "This verification link has expired or the sign-in has "
+                                           "already finished. Run <code>gatehouse-admin handoff</code> for a current one."), 404)
+        cookie = h.claim(request.cookies.get("gh_handoff"))
+        if cookie is None:
+            return self._html(GONE.replace("__MESSAGE__", "This link was already opened in another browser. "
+                                           "Use that browser, or wait for the next verification request."), 403)
+        resp = self._html(PAGE.replace("__ORIGIN__", h.origin.replace("&", "&amp;").replace("<", "&lt;")))
+        if cookie:
+            resp.set_cookie("gh_handoff", cookie, path=f"/handoff/{h.token}", httponly=True, samesite="Strict")
+        return resp
+
+    async def h_handoff_ws(self, request: web.Request):
+        h = self._handoff(request)
+        if h is None or not h.admits(request.cookies.get("gh_handoff")):
+            return web.json_response({"error": "forbidden"}, status=403)
+        ws = web.WebSocketResponse(max_msg_size=64 * 1024)
+        await ws.prepare(request)
+        await h.serve(ws)
+        return ws
 
     def _prune_requests(self) -> None:
         cutoff = time.time() - REQUEST_TTL

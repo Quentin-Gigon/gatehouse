@@ -53,33 +53,44 @@ ROOT_ALLOW = {
     "Browser.getVersion", "Browser.getWindowForTarget", "Browser.getWindowBounds", "Browser.setWindowBounds",
     "Browser.grantPermissions", "Browser.resetPermissions",
     "Storage.getCookies", "Storage.setCookies", "Storage.clearCookies",
+    "Target.getTargets", "Target.getTargetInfo", "Target.attachToTarget", "Target.detachFromTarget",
+    "Target.createTarget", "Target.closeTarget", "Target.activateTarget", "Target.setAutoAttach",
+    "Target.setDiscoverTargets", "Target.getBrowserContexts", "Target.createBrowserContext",
+    "Target.disposeBrowserContext",
 }
-ROOT_ALLOW_PREFIX = ("Target.",)
 # Accepted and answered with an empty result without reaching the browser.
 STUB = {"Browser.setDownloadBehavior", "Page.setDownloadBehavior"}
-# Refused everywhere.
+# Refused everywhere. sendMessageToTarget would tunnel commands past this filter.
 DENY = {
     "Target.exposeDevToolsProtocol", "Target.attachToBrowserTarget", "Target.setRemoteLocations",
+    "Target.sendMessageToTarget",
     "Browser.close", "Browser.crash", "Browser.crashGpuProcess",
-    "DOM.setFileInputFiles", "Page.setInterceptFileChooserDialog",
+    "DOM.setFileInputFiles", "Page.setInterceptFileChooserDialog", "Page.handleFileChooser",
+    "Input.dispatchDragEvent", "Input.setInterceptDrags",
     "Security.setIgnoreCertificateErrors", "Security.setOverrideCertificateErrors",
     "Network.setCertificateOverride", "Page.setBypassCSP",
 }
 DENY_PREFIX = ("Tracing.", "Extensions.", "SystemInfo.", "Tethering.", "Cast.", "Memory.", "HeapProfiler.")
 URL_METHODS = {"Page.navigate", "Target.createTarget", "Network.loadNetworkResource"}
+# Every agent session must be flat, so each command arrives as a top-level message this filter sees.
+FORCE_FLATTEN = {"Target.attachToTarget", "Target.setAutoAttach"}
 
 
 def check_agent_command(msg: dict, rootlike: bool) -> str | None:
-    """Return None to forward, 'stub' to answer locally, or a refusal reason."""
+    """Return None to forward, 'stub' to answer locally, or a refusal reason. May rewrite params."""
     method = msg.get("method")
     if not isinstance(method, str) or not isinstance(msg.get("id"), int):
+        return "malformed"
+    if msg.get("params") is not None and not isinstance(msg["params"], dict):
         return "malformed"
     if method in STUB:
         return "stub"
     if method in DENY or method.startswith(DENY_PREFIX):
         return "not permitted by broker"
-    if rootlike and method not in ROOT_ALLOW and not method.startswith(ROOT_ALLOW_PREFIX):
+    if rootlike and method not in ROOT_ALLOW:
         return "not permitted by broker at browser level"
+    if method in FORCE_FLATTEN:
+        msg["params"] = {**(msg.get("params") or {}), "flatten": True}
     if method in URL_METHODS:
         url = (msg.get("params") or {}).get("url", "")
         if url not in ("", "about:blank") and urlsplit(url).scheme.lower() not in ("http", "https"):
@@ -132,7 +143,8 @@ class Browser:
                 "--no-first-run", "--no-default-browser-check", "--disable-extensions",
                 "--disable-sync", "--disable-background-networking", "--password-store=basic",
                 "--use-mock-keychain", "--disable-features=PasswordManagerOnboarding,AutofillServerCommunication",
-                *(("--headless=new",) if self.headless else ()), *self.extra_args, "about:blank"]
+                "--disable-blink-features=AutomationControlled",
+                *(self._headless_args() if self.headless else ()), *self.extra_args, "about:blank"]
         # Chromium expects the pipe on descriptors 3 (read) and 4 (write). A tiny trampoline
         # puts them there and then becomes Chromium; no shell is involved.
         trampoline = ("import os,sys;os.dup2(int(sys.argv[1]),3);os.dup2(int(sys.argv[2]),4);"
@@ -146,6 +158,22 @@ class Browser:
         self._w = os.fdopen(to_chrome_w, "wb", buffering=0)
         self._reader_task = loop.create_task(self._read_loop(from_chrome_r))
         self.version = await self.call("Browser.getVersion", timeout=30)
+
+    def _headless_args(self) -> tuple[str, ...]:
+        """Headless Chromium announces itself as HeadlessChrome in a tiny window; many sites
+        answer that with a CAPTCHA. Present a desktop-sized window and the regular user agent."""
+        args = ["--headless=new", "--window-size=1280,900"]
+        if any(a.startswith("--user-agent=") for a in self.extra_args):
+            return tuple(args)
+        try:
+            out = subprocess.run([self.chrome, "--version"], capture_output=True, text=True, timeout=30).stdout
+            major = next(w for w in out.split() if w[:1].isdigit()).split(".")[0]
+        except (OSError, subprocess.SubprocessError, StopIteration):
+            return tuple(args)
+        platform = {"darwin": "Macintosh; Intel Mac OS X 10_15_7"}.get(sys.platform, "X11; Linux x86_64")
+        args.append(f"--user-agent=Mozilla/5.0 ({platform}) AppleWebKit/537.36 (KHTML, like Gecko) "
+                    f"Chrome/{major}.0.0.0 Safari/537.36")
+        return tuple(args)
 
     def _write_prefs(self) -> None:
         """Turn off Chromium's own password saving before first launch."""

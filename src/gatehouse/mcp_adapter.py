@@ -19,6 +19,15 @@ from .client import BrokerClient
 PROTOCOL = "2025-06-18"
 WAITING = ("in_progress", "human_verification_required")
 
+INSTRUCTIONS = """Gatehouse signs you in to websites the user has authorized, without ever showing you the password.
+
+- Call list_authorized_accounts to see which accounts you may use. If the account you need is not listed, ask the user to grant it (`gatehouse-admin grant add ...`); do not ask for the password.
+- Browse those sites only with the `gatehouse-browser` tools. They drive the browser that holds your signed-in sessions; any other browser tool is a different browser and is not signed in.
+- To sign in: open the site with gatehouse-browser, call request_login with the account_id, and on signed_in or already_signed_in continue in gatehouse-browser. The broker closes the browser connection while it types and your tabs are replaced by one signed-in tab; take a fresh snapshot before acting.
+- human_verification_required: the site wants a CAPTCHA or a code. Tell the user to run `gatehouse-admin handoff` in a terminal and finish it in the page that opens, then poll get_login_status.
+- permission_required: tell the user to run `gatehouse-admin approvals`. login_failed or permission_denied: stop and tell the user; never retry login_failed.
+- Never type passwords or one-time codes yourself and never ask the user for them."""
+
 TOOLS = [
     {"name": "list_authorized_accounts",
      "description": "List the accounts the user has authorized you to sign in to. Returns names, usernames and websites, never passwords.",
@@ -28,7 +37,7 @@ TOOLS = [
                      "your browser connection is closed while it does and you must reconnect afterwards. Waits up to wait_seconds, "
                      "then returns a status: signed_in, already_signed_in, permission_required, permission_denied, vault_locked, "
                      "human_verification_required, login_failed, unsupported_login_flow or in_progress. Do not retry login_failed; "
-                     "tell the user instead."),
+                     "tell the user instead. On human_verification_required ask the user to run `gatehouse-admin handoff`."),
      "inputSchema": {"type": "object", "required": ["account_id"], "properties": {
          "account_id": {"type": "string"}, "browser_session_id": {"type": "string", "description": "Defaults to your current browser session."},
          "wait_seconds": {"type": "number", "default": 60}}}},
@@ -70,7 +79,8 @@ class Adapter:
             return None  # notification
         if method == "initialize":
             result = {"protocolVersion": (msg.get("params") or {}).get("protocolVersion", PROTOCOL),
-                      "capabilities": {"tools": {}}, "serverInfo": {"name": "gatehouse", "version": "0.1.0"}}
+                      "capabilities": {"tools": {}}, "serverInfo": {"name": "gatehouse", "version": "0.2.0"},
+                      "instructions": INSTRUCTIONS}
         elif method == "ping":
             result = {}
         elif method == "tools/list":

@@ -1,5 +1,6 @@
 """End-to-end tests against a real Chromium and the synthetic site."""
 import asyncio
+import json
 
 import aiohttp
 import pytest
@@ -171,9 +172,24 @@ async def test_relay_refuses_dangerous_commands(env, agent_cdp):
                               ("DOM.setFileInputFiles", {"files": ["/etc/passwd"]}, sid),
                               ("Tracing.start", {}, None), ("Browser.close", {}, None),
                               ("Target.attachToBrowserTarget", {}, None), ("SystemInfo.getInfo", {}, None),
-                              ("Security.setIgnoreCertificateErrors", {"ignore": True}, sid)]:
+                              ("Security.setIgnoreCertificateErrors", {"ignore": True}, sid),
+                              ("Target.sendMessageToTarget", {"message": "{}", "sessionId": sid}, None),
+                              ("Input.dispatchDragEvent", {"type": "drop", "x": 1, "y": 1,
+                                                           "data": {"items": [], "dragOperationsMask": 1}}, sid),
+                              ("Page.handleFileChooser", {"action": "accept", "files": ["/etc/passwd"]}, sid),
+                              ("Target.exposeDevToolsProtocol", {"targetId": "x"}, None),
+                              ("Runtime.evaluate", {"expression": "1"}, None)]:
         assert "error" in await agent_cdp.call(method, params, s), method
     assert (await agent_cdp.call("Browser.getVersion"))["result"]["product"]
+
+
+async def test_relay_forces_flat_sessions(env, agent_cdp):
+    """A non-flat attach would tunnel commands through sendMessageToTarget, past the filter."""
+    targets = (await agent_cdp.call("Target.getTargets"))["result"]["targetInfos"]
+    tid = next(t["targetId"] for t in targets if t["type"] == "page")
+    sid = (await agent_cdp.call("Target.attachToTarget", {"targetId": tid, "flatten": False}))["result"]["sessionId"]
+    assert await agent_cdp.evaluate(sid, "1 + 1") == 2      # works only if the session is flat
+    assert "error" in await agent_cdp.call("DOM.setFileInputFiles", {"files": ["/etc/passwd"]}, sid)
 
 
 async def test_relay_needs_the_agents_token(env):
@@ -203,3 +219,50 @@ async def test_playwright_can_drive_the_browser_through_the_relay(env):
         assert "Signed in as reader" in await page.inner_text("body")
         await page.goto(env.origin + "/home")
         assert await page.locator("#account").count() == 1
+
+
+async def _wait_status(env, request_id, want, tries=80):
+    for _ in range(tries):
+        await asyncio.sleep(0.25)
+        _, st = await env.api("/v1/login/status", {"request_id": request_id})
+        if st["status"] == want:
+            return st
+    return st
+
+
+async def test_human_handoff_page_streams_and_replays_input(env):
+    cid = env.add_account("/captcha-login")
+    env.grant(cid)
+    sid = await env.session_id()
+    _, r = await env.api("/v1/login", {"account_id": cid, "browser_session_id": sid})
+    assert (await _wait_status(env, r["request_id"], L.HUMAN))["status"] == L.HUMAN
+    [handoff] = json.loads(env.store.get_setting("handoffs"))
+    assert handoff["account_id"] == cid and handoff["request_id"] == r["request_id"]
+    base = f"http://127.0.0.1:{env.port}/handoff/{handoff['token']}"
+
+    jar = aiohttp.CookieJar(unsafe=True)                         # browsers keep cookies for 127.0.0.1
+    async with aiohttp.ClientSession(cookie_jar=jar) as viewer, aiohttp.ClientSession() as other:
+        async with viewer.get(base) as resp:                     # first browser claims the link
+            assert resp.status == 200 and "gh_handoff" in resp.cookies
+        async with other.get(base) as resp:                      # any other browser is refused
+            assert resp.status == 403
+        async with other.get(base + "/ws") as resp:
+            assert resp.status == 403
+        async with viewer.get(base, headers={"Origin": "https://evil.example"}) as resp:
+            assert resp.status == 403
+        async with viewer.ws_connect(base + "/ws", origin=f"http://127.0.0.1:{env.port}") as ws:
+            frame = json.loads((await ws.receive(timeout=15)).data)
+            assert frame["t"] == "frame" and frame["data"]
+            # click the page's "I am human" button through the live view
+            x, y = 50 / frame["w"], 50 / frame["h"]
+            for typ in ("mousePressed", "mouseReleased"):
+                await ws.send_str(json.dumps({"t": "mouse", "type": typ, "x": x, "y": y, "button": "left", "clicks": 1}))
+            while True:
+                msg = await ws.receive(timeout=20)
+                if msg.type != aiohttp.WSMsgType.TEXT or json.loads(msg.data)["t"] == "done":
+                    break
+    assert env.site.captcha_solved
+    assert (await _wait_status(env, r["request_id"], L.SIGNED_IN))["status"] == L.SIGNED_IN
+    assert json.loads(env.store.get_setting("handoffs")) == []
+    async with env.http.get(base) as resp:                        # link is dead once the sign-in moves on
+        assert resp.status == 404
